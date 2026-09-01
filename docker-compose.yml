@@ -1,0 +1,26 @@
+# Throwaway Postgres for the pipeline and the Phase 4 idempotency burst test.
+# The idempotency test MUST run against this real UNIQUE constraint — a green
+# result on SQLite or a mocked lock proves nothing.
+#
+#   docker compose up -d db
+#
+services:
+  db:
+    image: postgres:16-alpine
+    # The Phase 4 burst opens 100 genuinely concurrent connections; the default
+    # max_connections=100 (minus superuser reservations) would refuse some and
+    # stall the test's start barrier.
+    command: postgres -c max_connections=250
+    environment:
+      POSTGRES_USER: avirata
+      POSTGRES_PASSWORD: avirata
+      POSTGRES_DB: avirata
+    ports:
+      - "5432:5432"
+    tmpfs:
+      - /var/lib/postgresql/data   # ephemeral: fast, wiped on restart
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U avirata"]
+      interval: 2s
+      timeout: 3s
+      retries: 15

@@ -1,0 +1,11 @@
+[project]
+name = "avirata"
+version = "0.1.0"
+description = "Silent Mandate Death Recovery Agent — deterministic revenue-recovery pipeline"
+requires-python = ">=3.12"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-q"
