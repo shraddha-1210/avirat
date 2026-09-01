@@ -19,6 +19,9 @@ from layers.recovery_policy import (
     score_recovery_risk,
 )
 
+# `score_recovery_risk`'s default; the gate bound is derived from it.
+_EXPECTED_RECOVERY_RATE = 0.6
+
 # A deliberately calm event: reliable mandate, small amount, cycle far away.
 _LOW_RISK = dict(days_to_next_cycle=28, mandate_reliability=0.97, amount=120)
 # A deliberately alarming one: flaky mandate, large amount, cycle tomorrow.
@@ -99,55 +102,63 @@ def test_high_risk_eligible_cause_fires_alt_rail():
     assert decision.risk.cost_benefit_passed is True
 
 
-def test_cost_benefit_gate_blocks_alt_rail_even_at_high_score():
-    """The cost-benefit gate must veto the alt rail on its own, independent of score.
+def _largest_amount_failing_cost_benefit() -> int:
+    """Biggest amount whose expected loss still cannot justify one alt-rail attempt.
 
-    Constructed directly rather than via `score_recovery_risk`, because under the
-    current weights no real input reaches a passing score while failing
-    cost-benefit — see `test_cost_benefit_gate_is_currently_unreachable`. This
-    asserts the gate LOGIC, so it stays honest if the weights are retuned.
+    Derived from the live config rather than hard-coded. An earlier version of
+    this file pinned `range(0, 31)` — a bound that silently encoded the old
+    ₹12 cost. When the cost was retuned the scan no longer covered the region
+    where the gate operates, and the test kept passing while asserting nothing.
     """
-    risk = RiskScore(
-        score=0.99,                 # score gate would pass ...
-        urgency=1.0,
-        unreliability=1.0,
-        amount_tier=0.002,
-        cost_benefit=0.0,
-        expected_loss=4.0,          # ... but ₹4 recovered cannot justify ₹12 spent
-        alt_rail_cost=ALT_RAIL_COST_RUPEES,
-        cost_benefit_passed=False,
+    return int(ALT_RAIL_COST_RUPEES / (1.0 - _EXPECTED_RECOVERY_RATE))
+
+
+def test_cost_benefit_gate_blocks_alt_rail_even_at_high_score():
+    """The cost-benefit gate must veto the alt rail on its own, at a passing score.
+
+    Driven by real inputs through `score_recovery_risk`, not a constructed
+    RiskScore: the point is that this state is reachable in the actual system.
+    """
+    amount = _largest_amount_failing_cost_benefit()
+    risk = score_recovery_risk(
+        days_to_next_cycle=0,        # maximum urgency
+        mandate_reliability=0.0,     # maximum unreliability
+        amount=amount,
     )
+    assert risk.score >= settings.risk_firing_threshold, "score gate must PASS here"
+    assert risk.cost_benefit_passed is False, "cost-benefit gate must FAIL here"
+
     decision = map_diagnosis_to_action(
         cause="mandate_revoked", diagnosis_tier=2, diagnosis_status="resolved", risk=risk
     )
     assert decision.action == "SAFE_HOLD"
-    assert "cost-benefit" in decision.reason
-
-
-def test_cost_benefit_gate_is_currently_unreachable():
-    """Documents a real property of the CURRENT weights: the gate is redundant.
-
-    `cost_benefit_passed` is False only when expected_loss <= ₹12, i.e. amount
-    <= ₹30. But amount carries weight 0.4, so a ₹30 event tops out at a score of
-    ~0.507 — under the 0.60 firing threshold. The score gate therefore always
-    trips first and the AND never has to arbitrate.
-
-    The gate is kept as defence in depth, not deleted. If the weights, the
-    threshold, the alt-rail cost or the recovery-rate assumption are retuned,
-    this test flips to failing and tells you the gate has become load-bearing
-    and now needs its own live coverage.
-    """
-    worst = max(
-        (
-            score_recovery_risk(days_to_next_cycle=0, mandate_reliability=0.0, amount=amount)
-            for amount in range(0, 31)
-        ),
-        key=lambda r: r.score,
+    assert "cost-benefit" in decision.reason, (
+        f"the cost-benefit gate must be the stated reason, got: {decision.reason}"
     )
-    assert worst.cost_benefit_passed is False
-    assert worst.score < settings.risk_firing_threshold, (
-        "the cost-benefit gate has become reachable — it now independently blocks "
-        "alt-rail and needs a test driven by real inputs, not a constructed RiskScore"
+
+
+def test_cost_benefit_gate_is_reachable():
+    """The gate must be live code, not decoration.
+
+    Replaces `test_cost_benefit_gate_is_currently_unreachable`, which asserted
+    the opposite and was true only under the pre-retune weights. If a future
+    retune makes the gate unreachable again, this fails and says so — the gate
+    would then be silently dead rather than merely redundant.
+    """
+    ceiling = _largest_amount_failing_cost_benefit()
+    reachable = [
+        risk
+        for amount in range(0, ceiling + 1, max(1, ceiling // 200))
+        if (
+            risk := score_recovery_risk(
+                days_to_next_cycle=0, mandate_reliability=0.0, amount=amount
+            )
+        ).score >= settings.risk_firing_threshold
+        and not risk.cost_benefit_passed
+    ]
+    assert reachable, (
+        "no input reaches a passing score while failing cost-benefit — the gate "
+        "is dead code again; re-run scripts/gate_analysis.py and retune"
     )
 
 

@@ -53,9 +53,16 @@ _CAUSE_TO_ACTION: dict[str, ActionType] = {
     "authentication_failure": "ALT_RAIL",
 }
 
-# Rupee cost of one alt-rail attempt (gateway + comms). Illustrative demo value;
-# requires finance sign-off before production use.
-ALT_RAIL_COST_RUPEES: float = 12.0
+# Fully-loaded rupee cost of ONE alt-rail attempt. This is deliberately NOT just
+# the gateway fee: an alt-rail collection runs outside the mandate, so the real
+# cost carries ops handling plus the settlement-collision exposure that Layer 5
+# has to auto-refund. Retuned 12 -> 1600 (Phase 4 follow-up) so the cost-benefit
+# gate is reachable on real events instead of being unreachable dead code.
+#
+# ILLUSTRATIVE DEMO VALUE and a material modelling assumption: at 1600 the alt
+# rail is reserved for high-value recoveries only (expected loss must clear it).
+# Requires finance sign-off before production use.
+ALT_RAIL_COST_RUPEES: float = 1600.0
 
 # Amount normalisation ceiling: amounts at or above this are the top tier.
 # Illustrative demo value; retune on the real amount distribution.

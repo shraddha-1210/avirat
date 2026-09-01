@@ -42,8 +42,13 @@ class Settings(BaseSettings):
     # --- Layer 4: recovery policy + idempotency ---
     risk_weight_urgency: float = 0.2           # illustrative; require actuary review
     risk_weight_reliability: float = 0.3
-    risk_weight_amount: float = 0.4
-    risk_weight_cost_benefit: float = 0.1
+    # Retuned from 0.4 -> 0.5 (Phase 4 follow-up). Cost-benefit's former 0.1 was
+    # folded in here: expected loss was being counted TWICE — once as a score
+    # component and again as the hard alt-rail gate. It is now purely a gate,
+    # which is also what makes that gate reachable on real events. Weights must
+    # still sum to 1.0 (test_weights_sum_to_one).
+    risk_weight_amount: float = 0.5
+    risk_weight_cost_benefit: float = 0.0
     risk_firing_threshold: float = 0.6         # alt-rail requires score >= this AND cost-benefit pass
     max_retries: int = 2
     ttl_processing_seconds: int = 300          # a case may sit in 'processing' at most this long
