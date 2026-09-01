@@ -43,6 +43,70 @@ docker compose up -d db                            # Postgres for the pipeline +
   it (CI never hits the network).
 - **₹ Recovered is a controlled simulation** on a fixed synthetic seed.
 
+## Idempotency proof (Layer 4c)
+
+The core robustness claim: **a duplicate webhook can never double-charge.**
+Exactly-once is enforced by a PostgreSQL `UNIQUE (mandate_id, billing_cycle)`
+constraint on `actions_log` plus `INSERT ... ON CONFLICT DO NOTHING RETURNING`,
+never an application lock.
+
+```bash
+docker compose up -d db
+.venv\Scripts\pytest tests/test_idempotency.py -v
+```
+
+Two things make that proof real, and both are asserted rather than assumed:
+
+- **It runs against the actual constraint.** `tests/conftest.py` skips loudly if
+  Postgres is unreachable and refuses any other dialect — a green run on SQLite
+  or a mocked lock would prove nothing.
+- **The burst genuinely collides.** Workers open their own connections and are
+  released together by a `threading.Barrier`; without it `ThreadPoolExecutor`
+  staggers thread starts and the first commit lands before the others read.
+  `test_harness_produces_real_contention` runs a naive SELECT-then-INSERT guard
+  through the same harness and asserts it *breaks* — if that test ever passes
+  cleanly, the burst has stopped colliding and every other assertion is vacuous.
+
+100 concurrent threads and 50 concurrent `asyncio.gather` tasks each produce
+exactly one row, with no unhandled exceptions.
+
+## Alt-rail gating (retuned)
+
+`plan.md` requires alt-rail to need a high risk score **AND** a cost-benefit
+pass. As first shipped the second gate never arbitrated: `cost_benefit_passed`
+was False only for amounts <= Rs 30, and such an event could not clear the 0.60
+firing threshold, so the score gate always tripped first.
+
+Retuned so both gates do real work:
+
+| | before | after |
+|---|---|---|
+| `risk_weight_amount` | 0.4 | 0.5 |
+| `risk_weight_cost_benefit` | 0.1 | 0.0 |
+| `ALT_RAIL_COST_RUPEES` | 12 | 1600 |
+
+Dropping the cost-benefit weight to 0 removes a genuine double-count: expected
+loss was being scored *and* used as the hard gate. It is now purely a gate, and
+its old weight moved to amount so the weights still sum to 1.0.
+
+`ALT_RAIL_COST_RUPEES = 1600` is **a material modelling assumption, not a
+gateway fee**. It represents the fully-loaded cost of one alt-rail attempt --
+ops handling plus the settlement-collision exposure Layer 5 has to auto-refund.
+At this value the alt rail is reserved for high-value recoveries. It needs
+finance sign-off before production use.
+
+Verify on the seeded corpus:
+
+```bash
+.venv\Scripts\python scripts\gate_analysis.py
+```
+
+Across the 65 alt-rail-eligible events, cost-benefit now decides 1 case the
+score gate would have passed (`EVT-42-00084`, Rs 2999: score 0.603 clears 0.60,
+but expected loss Rs 1199.60 does not clear the Rs 1600 cost).
+`test_cost_benefit_gate_is_reachable` fails if a future retune makes it dead
+again.
+
 ## Status
 
 See `plan.md` checkboxes for the current layer.
