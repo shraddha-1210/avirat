@@ -179,3 +179,86 @@ def test_every_event_is_diagnosed_and_recorded_even_when_not_fired(seeded, pg_se
 
     assert pg_session.execute(select(func.count()).select_from(Diagnosis)).scalar_one() == 2
     assert pg_session.execute(select(func.count()).select_from(ActionsLog)).scalar_one() == 1
+
+
+# ---------------------------------------------------------------------------
+# Phase 5 — the full double-charge scenario, end to end.
+# ---------------------------------------------------------------------------
+def test_alt_rail_dispatch_opens_a_settlement_hold(seeded, pg_session, mock_llm_call):
+    """The hold must open at DISPATCH, not at settlement.
+
+    If it opened only when a webhook arrived, a mandate-rail collection landing
+    first would have no hold to collide with and both paths would settle.
+    """
+    from layers.reconciliation import PENDING
+    from models import ReconciliationLedger
+
+    mock_llm_call.return_value = json.dumps(
+        {"cause": "mandate_revoked", "confidence": 0.97, "rationale": "payer revoked"}
+    )
+    outcome = _run(
+        pg_session,
+        raw_error_code="MANDATE_REVOKED_BY_PAYER",
+        amount=4800,
+        mandate_reliability=0.55,
+        days_to_next_cycle=1,
+    )
+    pg_session.commit()
+
+    assert outcome.decision["action"] == "ALT_RAIL"
+    hold = pg_session.execute(select(ReconciliationLedger)).scalar_one()
+    assert hold.path == "alt_rail"
+    assert hold.status == PENDING
+    assert hold.amount == 4800
+
+
+def test_non_alt_rail_action_opens_no_hold(seeded, pg_session, mock_llm_call):
+    """A RETRY collects on the original mandate — there is no second rail to
+    reconcile, so opening a hold would create phantom Ops escalations."""
+    from models import ReconciliationLedger
+
+    _run(pg_session)  # U30 -> bank_downtime -> RETRY
+    pg_session.commit()
+    assert pg_session.execute(
+        select(func.count()).select_from(ReconciliationLedger)
+    ).scalar_one() == 0
+
+
+def test_double_charge_is_prevented_end_to_end(seeded, pg_session, mock_llm_call):
+    """THE scenario the whole system exists to prevent.
+
+    Alt-rail fires on a revoked mandate; then the mandate rail unexpectedly
+    collects too. Exactly one path may settle, and the customer must be made
+    whole on the other.
+    """
+    from layers.reconciliation import AUTO_REFUNDED, SETTLED, resolve_path
+    from models import ReconciliationLedger
+
+    mock_llm_call.return_value = json.dumps(
+        {"cause": "mandate_revoked", "confidence": 0.97, "rationale": "payer revoked"}
+    )
+    _run(
+        pg_session,
+        raw_error_code="MANDATE_REVOKED_BY_PAYER",
+        amount=4800,
+        mandate_reliability=0.55,
+        days_to_next_cycle=1,
+    )
+    pg_session.commit()
+
+    alt = resolve_path(pg_session, mandate_id=MANDATE_ID, billing_cycle=CYCLE, path="alt_rail")
+    pg_session.commit()
+    mandate = resolve_path(
+        pg_session, mandate_id=MANDATE_ID, billing_cycle=CYCLE, path="mandate", amount=4800
+    )
+    pg_session.commit()
+
+    assert alt.status == SETTLED
+    assert mandate.status == AUTO_REFUNDED
+    assert mandate.collided_with == "alt_rail"
+
+    settled = pg_session.execute(
+        select(func.count()).select_from(ReconciliationLedger)
+        .where(ReconciliationLedger.status == SETTLED)
+    ).scalar_one()
+    assert settled == 1, "the customer was charged twice"

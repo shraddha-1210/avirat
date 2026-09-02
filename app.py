@@ -7,6 +7,7 @@ Reconciliation and dashboard routes are added in later phases.
 from __future__ import annotations
 
 from datetime import datetime, timedelta
+from typing import Literal
 
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
@@ -15,6 +16,7 @@ import store
 from db import get_session
 from layers.detection import check_anomaly
 from layers.pipeline import run_recovery
+from layers.reconciliation import resolve_path
 
 app = FastAPI(title="Avirata — Silent Mandate Death Recovery Agent")
 
@@ -42,7 +44,7 @@ class DeclineEventIn(BaseModel):
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"status": "ok", "service": "avirata", "phase": "4-recovery-policy"}
+    return {"status": "ok", "service": "avirata", "phase": "5-reconciliation"}
 
 
 @app.post("/api/events/ingest")
@@ -139,3 +141,39 @@ def recover_event(req: RecoveryRequestIn) -> dict:
         )
         session.commit()
     return outcome.to_dict()
+
+
+class SettlementWebhookIn(BaseModel):
+    """A payment rail reporting that it collected for one billing cycle.
+
+    Either rail can report first. Whichever does wins; a second arrival for the
+    same key is a collision and gets refunded rather than settled.
+    """
+
+    mandate_id: str
+    billing_cycle: str
+    path: Literal["mandate", "alt_rail"]
+    amount: int | None = None
+
+
+@app.post("/api/webhooks/settlement")
+def settlement_webhook(req: SettlementWebhookIn) -> dict:
+    """Record a settlement, auto-refunding a collision inside the hold window.
+
+    Safe to replay: a webhook for an already-terminal path is reported back as
+    that same terminal status and changes nothing.
+    """
+    with get_session() as session:
+        result = resolve_path(
+            session,
+            mandate_id=req.mandate_id,
+            billing_cycle=req.billing_cycle,
+            path=req.path,
+            amount=req.amount,
+        )
+        session.commit()
+    return {
+        "mandate_id": req.mandate_id,
+        "billing_cycle": req.billing_cycle,
+        **result.to_dict(),
+    }

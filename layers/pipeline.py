@@ -14,7 +14,8 @@ Ordering is deliberate and load-bearing:
    attempt for the (mandate_id, billing_cycle) key. Everything after this point
    is skipped on a duplicate — including comms, because a replayed webhook must
    not re-message the customer.
-4. **Claim the comms mutex** only if the action that actually won was ALT_RAIL.
+4. **Claim the comms mutex and open the Layer 5 settlement hold** only if the
+   action that actually won was ALT_RAIL.
 
 The caller commits. Nothing here commits on its own, so a failure part-way
 leaves no half-applied decision.
@@ -30,6 +31,7 @@ from sqlalchemy.orm import Session
 import store
 from layers.comms_orchestrator import send_nudge, set_alt_rail_live
 from layers.diagnosis import diagnose
+from layers.reconciliation import open_hold
 from layers.recovery_policy import PolicyDecision, decide, fire_action_idempotent
 
 logger = logging.getLogger(__name__)
@@ -119,6 +121,17 @@ def run_recovery(
         # customer holds an alt-rail payment link.
         set_alt_rail_live(session, mandate_id=mandate_id, billing_cycle=billing_cycle)
         comms = {"mutex": "alt_rail_live", "claimed": True}
+        # Layer 5: open the settlement hold at dispatch, not at settlement. The
+        # window has to start counting from the moment money could move on this
+        # path, otherwise a collision arriving before any webhook has no hold to
+        # collide with.
+        open_hold(
+            session,
+            mandate_id=mandate_id,
+            billing_cycle=billing_cycle,
+            path="alt_rail",
+            amount=amount,
+        )
     elif decision.action == "NUDGE_BALANCE":
         comms = send_nudge(
             session, mandate_id=mandate_id, billing_cycle=billing_cycle

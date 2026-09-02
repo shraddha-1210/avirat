@@ -70,6 +70,44 @@ Two things make that proof real, and both are asserted rather than assumed:
 100 concurrent threads and 50 concurrent `asyncio.gather` tasks each produce
 exactly one row, with no unhandled exceptions.
 
+## Double-charge prevention (Layer 5)
+
+Layer 4 can fire an alt-rail collection because the mandate looked dead. If the
+mandate rail then collects too, the customer has paid twice for one cycle.
+Reconciliation guarantees **at most one `settled` row per
+(mandate_id, billing_cycle)** and refunds any second collection.
+
+Like Layer 4c, that guarantee is a database object rather than an if-statement:
+
+```sql
+CREATE UNIQUE INDEX uq_recon_single_settled
+  ON reconciliation_ledger (mandate_id, billing_cycle)
+  WHERE status = 'settled';
+```
+
+`resolve_path()` attempts the settle inside a SAVEPOINT and treats the index
+violation as the collision signal, so two webhooks landing in the same
+millisecond cannot both win. Verified load-bearing: with the index dropped, a
+two-thread settlement race produces **two** settled rows.
+
+Hold outcomes are deliberately distinct — conflating them would either hide a
+real problem or bury it in noise:
+
+| status | meaning |
+|---|---|
+| `settled` | this path collected (at most one per key) |
+| `auto_refunded` | collided with an already-settled path; money returned |
+| `expired_escalated` | window elapsed, **nothing** settled -> Ops queue |
+| `closed_superseded` | window elapsed but the sibling settled; nothing to refund, nothing to escalate |
+
+A collision *inside* the hold window refunds silently — that is the designed
+path. A collision *after* it refunds **and** escalates, because an operator may
+already have acted on the expired hold.
+
+```bash
+.venv\Scripts\pytest tests/test_reconciliation.py -v
+```
+
 ## Alt-rail gating (retuned)
 
 `plan.md` requires alt-rail to need a high risk score **AND** a cost-benefit

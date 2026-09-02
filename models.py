@@ -10,6 +10,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     Boolean,
+    Index,
     DateTime,
     Float,
     ForeignKey,
@@ -19,6 +20,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -104,9 +106,26 @@ class ActionsLog(Base):
 
 
 class ReconciliationLedger(Base):
+    """One row per (key, path). At most ONE of them may ever be `settled`.
+
+    That "at most one" is enforced by a PARTIAL UNIQUE INDEX, not by application
+    logic: two settlement webhooks can arrive concurrently, and a
+    read-then-write check would let both through. `uq_recon_single_settled`
+    makes a double-settle impossible at the database level, and Layer 5 uses the
+    resulting IntegrityError as its collision signal — the same pattern as the
+    Layer 4c idempotency guard.
+    """
+
     __tablename__ = "reconciliation_ledger"
     __table_args__ = (
         UniqueConstraint("mandate_id", "billing_cycle", "path", name="uq_recon_key_path"),
+        Index(
+            "uq_recon_single_settled",
+            "mandate_id",
+            "billing_cycle",
+            unique=True,
+            postgresql_where=text("status = 'settled'"),
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
@@ -115,7 +134,13 @@ class ReconciliationLedger(Base):
     path: Mapped[str] = mapped_column(String(12))  # 'mandate' | 'alt_rail'
     amount: Mapped[int] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(24), default="pending")
-    # 'pending' | 'settled' | 'auto_refunded' | 'expired_escalated'
+    # 'pending'            — hold open, awaiting a settlement webhook
+    # 'settled'            — this path collected the money (at most one per key)
+    # 'auto_refunded'      — collided with an already-settled path; money returned
+    # 'expired_escalated'  — hold window elapsed with NO path settled -> Ops
+    # 'closed_superseded'  — hold expired, but the sibling path settled. No money
+    #                        moved on this path, so there is nothing to refund and
+    #                        nothing to escalate; the row is simply closed.
     opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
