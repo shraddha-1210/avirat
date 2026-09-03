@@ -43,7 +43,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from config import settings
-from models import OpsEscalationQueue, ReconciliationLedger
+from models import ActionsLog, OpsEscalationQueue, ReconciliationLedger
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +103,27 @@ def _dispatch_refund(*, mandate_id: str, billing_cycle: str, path: Path, amount:
         billing_cycle,
         amount,
     )
+
+
+def _close_action(session: Session, *, mandate_id: str, billing_cycle: str, now: datetime) -> None:
+    """Stamp the Layer 4 action for this key as resolved.
+
+    Layer 6 measures MTTR from `ActionsLog.created_at` to `resolved_at`, so the
+    clock has to be stopped by whichever layer actually reaches a terminal
+    state. Reconciliation is that layer for money paths; the TTL watchdog is it
+    for abandoned ones. Only the first terminal event wins — a later refund must
+    not rewrite an earlier settlement's duration.
+    """
+    action = session.execute(
+        select(ActionsLog)
+        .where(ActionsLog.mandate_id == mandate_id)
+        .where(ActionsLog.billing_cycle == billing_cycle)
+    ).scalar_one_or_none()
+    if action is not None and action.resolved_at is None:
+        action.resolved_at = now
+        if action.status == "processing":
+            action.status = "settled"
+        session.flush()
 
 
 def open_hold(
@@ -238,6 +259,7 @@ def resolve_path(
             ),
         )
 
+    _close_action(session, mandate_id=mandate_id, billing_cycle=billing_cycle, now=now)
     return ReconResult(
         path=path,
         status=SETTLED,
@@ -313,6 +335,9 @@ def sweep_expired_holds(session: Session, *, now: datetime | None = None) -> Swe
 
         row.status = EXPIRED_ESCALATED
         row.resolved_at = now
+        _close_action(
+            session, mandate_id=row.mandate_id, billing_cycle=row.billing_cycle, now=now
+        )
         _escalate(
             session,
             mandate_id=row.mandate_id,

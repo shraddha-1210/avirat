@@ -73,6 +73,7 @@ def sweep_stuck_actions(session: Session, *, now: datetime | None = None) -> Swe
     escalated_keys: list[tuple[str, str]] = []
     for action in stuck:
         action.status = _ESCALATED_STATUS
+        action.resolved_at = now      # terminal: Layer 6 counts it in MTTR
         session.add(
             OpsEscalationQueue(
                 mandate_id=action.mandate_id,

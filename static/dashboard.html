@@ -1,0 +1,366 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Avirata — Recovery Dashboard</title>
+<style>
+  :root {
+    color-scheme: light;
+    --surface-1: #fcfcfb;
+    --page: #f9f9f7;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --muted: #898781;
+    --grid: #e1e0d9;
+    --baseline: #c3c2b7;
+    --border: rgba(11,11,11,0.10);
+    --treatment: #2a78d6;
+    --control: #eb6834;
+    --tier-1: #86b6ef;
+    --tier-2: #2a78d6;
+    --tier-3: #104281;
+    --good: #0ca30c;
+    --warning: #fab219;
+    --serious: #ec835a;
+    --critical: #d03b3b;
+    --success-text: #006300;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --surface-1: #1a1a19;
+      --page: #0d0d0d;
+      --text-primary: #ffffff;
+      --text-secondary: #c3c2b7;
+      --muted: #898781;
+      --grid: #2c2c2a;
+      --baseline: #383835;
+      --border: rgba(255,255,255,0.10);
+      --treatment: #3987e5;
+      --control: #d95926;
+      --tier-1: #b7d3f6;
+      --tier-2: #5598e7;
+      --tier-3: #184f95;
+      --success-text: #0ca30c;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --surface-1: #1a1a19;
+    --page: #0d0d0d;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --baseline: #383835;
+    --border: rgba(255,255,255,0.10);
+    --treatment: #3987e5;
+    --control: #d95926;
+    --tier-1: #b7d3f6;
+    --tier-2: #5598e7;
+    --tier-3: #184f95;
+    --success-text: #0ca30c;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--text-primary);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-variant-numeric: tabular-nums;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 28px 20px 64px; }
+
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 12px; margin-bottom: 6px; }
+  h1 { font-size: 20px; margin: 0; letter-spacing: -0.01em; }
+  .sub { color: var(--text-secondary); font-size: 13px; }
+  .banner {
+    margin: 14px 0 24px; padding: 10px 14px; border-radius: 8px;
+    background: color-mix(in srgb, var(--warning) 14%, var(--surface-1));
+    border: 1px solid color-mix(in srgb, var(--warning) 45%, transparent);
+    color: var(--text-primary); font-size: 13px;
+  }
+  .banner strong { font-weight: 650; }
+
+  .card {
+    background: var(--surface-1); border: 1px solid var(--border);
+    border-radius: 10px; padding: 18px 20px;
+  }
+  h2 { font-size: 13px; font-weight: 650; margin: 0 0 2px; letter-spacing: 0.01em; }
+  .note { color: var(--muted); font-size: 12px; margin: 0 0 16px; }
+
+  .kpis { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); margin-bottom: 22px; }
+  .kpi .label { color: var(--text-secondary); font-size: 12px; margin-bottom: 6px; }
+  .kpi .value { font-size: 30px; font-weight: 640; letter-spacing: -0.02em; line-height: 1.1; }
+  .kpi .value.hero { font-size: 42px; }
+  .kpi .foot { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .kpi .foot.pos { color: var(--success-text); }
+  .unmeasured { color: var(--muted); font-size: 22px; font-weight: 500; font-style: italic; }
+
+  .grid2 { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); margin-bottom: 22px; }
+  .grid2.stretch > .card { min-width: 0; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; margin-bottom: 12px; font-size: 12px; color: var(--text-secondary); }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+
+  .rows { display: flex; flex-direction: column; gap: 14px; }
+  .row .top { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin-bottom: 5px; font-size: 12px; }
+  .row .name { color: var(--text-primary); font-weight: 550; }
+  .row .val { color: var(--text-secondary); }
+  .track { background: color-mix(in srgb, var(--grid) 60%, transparent); border-radius: 4px; height: 22px; overflow: hidden; }
+  .bar { height: 100%; border-radius: 0 4px 4px 0; min-width: 2px; transition: width .3s ease; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--grid); }
+  th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+  th.sortable { cursor: pointer; user-select: none; }
+  th.sortable:hover { color: var(--text-primary); }
+  th .arrow { opacity: .5; font-size: 9px; }
+  tbody tr:last-child td { border-bottom: none; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+  .scroll { overflow-x: auto; }
+
+  .pill { display: inline-flex; align-items: center; gap: 5px; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; border: 1px solid var(--border); }
+  .pill::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .pill.good { color: var(--success-text); }
+  .pill.warn { color: #8a6100; }
+  .pill.crit { color: var(--critical); }
+  :root[data-theme="dark"] .pill.warn, :root:not([data-theme="light"]) .pill.warn { color: var(--warning); }
+
+  .empty { color: var(--muted); font-style: italic; padding: 14px 2px; font-size: 13px; }
+  footer { margin-top: 28px; color: var(--muted); font-size: 12px; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+  .err { border-color: color-mix(in srgb, var(--critical) 50%, transparent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>Avirata — Silent Mandate Death Recovery</h1>
+    <span class="sub" id="generated">loading…</span>
+  </header>
+
+  <div class="banner" id="disclaimer">
+    <strong>Controlled simulation.</strong> Figures are computed from a fixed synthetic seed, not live production data.
+  </div>
+
+  <div class="kpis" id="kpis"></div>
+
+  <div class="grid2 stretch">
+    <div class="card">
+      <h2>Rupees recovered — treatment vs control</h2>
+      <p class="note">Settled ledger amounts by experiment arm. Refunded collisions are excluded.</p>
+      <div class="legend">
+        <span><i class="swatch" style="background:var(--treatment)"></i>Treatment (intervention)</span>
+        <span><i class="swatch" style="background:var(--control)"></i>Control (baseline)</span>
+      </div>
+      <div class="rows" id="recovered"></div>
+    </div>
+
+    <div class="card">
+      <h2>MTTR by diagnosis tier</h2>
+      <p class="note">Dispatch to terminal state. In-flight actions are excluded, never counted as zero.</p>
+      <div class="rows" id="mttr"></div>
+    </div>
+  </div>
+
+  <div class="grid2 stretch">
+    <div class="card">
+      <h2>Actions dispatched</h2>
+      <p class="note">One action per (mandate, billing cycle), enforced by a database constraint.</p>
+      <div class="rows" id="actions"></div>
+    </div>
+
+    <div class="card">
+      <h2>Detection — MAD by segment</h2>
+      <p class="note">Median Absolute Deviation per (bank, mandate type). N &ge; 30 gate applies.</p>
+      <div class="scroll"><table id="segments"></table></div>
+    </div>
+  </div>
+
+  <div class="card" style="margin-bottom:14px">
+    <h2>Ops escalation queue</h2>
+    <p class="note">Click a column to sort.</p>
+    <div class="scroll"><table id="ops"></table></div>
+  </div>
+
+  <div class="grid2 stretch">
+    <div class="card">
+      <h2>Tier 3 quarantine backlog</h2>
+      <p class="note">Strings the ontology could not map. Awaiting Ops review and promotion.</p>
+      <div class="scroll"><table id="quarantine"></table></div>
+    </div>
+    <div class="card">
+      <h2>Reconciliation ledger</h2>
+      <p class="note">At most one <code>settled</code> row per key — a partial unique index guarantees it.</p>
+      <div class="rows" id="ledger"></div>
+    </div>
+  </div>
+
+  <footer>
+    Data from <code>GET /api/dashboard/summary</code>. Per-decision audit trail at
+    <code>GET /api/audit/decision/{mandate_id}/{billing_cycle}</code>.
+    Alt-rail execution is a prototype requiring RBI e-mandate / AFA review.
+  </footer>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const fmtInt = (n) => n == null ? "—" : n.toLocaleString("en-IN");
+const rupee = (n) => n == null ? "—" : "₹" + Math.round(n).toLocaleString("en-IN");
+
+function duration(sec) {
+  if (sec == null) return null;
+  if (sec < 90) return sec.toFixed(1) + "s";
+  if (sec < 5400) return (sec / 60).toFixed(1) + "m";
+  return (sec / 3600).toFixed(1) + "h";
+}
+
+function kpi({ label, value, foot, hero, unmeasured, positive }) {
+  const v = unmeasured
+    ? `<div class="unmeasured">not measured</div>`
+    : `<div class="value${hero ? " hero" : ""}">${value}</div>`;
+  return `<div class="card kpi"><div class="label">${label}</div>${v}
+    ${foot ? `<div class="foot${positive ? " pos" : ""}">${foot}</div>` : ""}</div>`;
+}
+
+// Horizontal bars. Widths are proportional to the largest value present, so the
+// longest bar fills the track and the rest are read against it.
+function barRows(items, { color, format }) {
+  if (!items.length) return `<div class="empty">No data yet.</div>`;
+  const max = Math.max(...items.map((i) => i.value || 0), 1);
+  return items.map((i) => `
+    <div class="row">
+      <div class="top"><span class="name">${i.name}</span><span class="val">${format(i.value)}${i.suffix || ""}</span></div>
+      <div class="track"><div class="bar" style="width:${Math.max((i.value || 0) / max * 100, 0)}%;background:${i.color || color}"></div></div>
+    </div>`).join("");
+}
+
+function table(el, cols, rows, opts = {}) {
+  if (!rows.length) { el.outerHTML = `<div class="empty">${opts.empty || "Nothing here."}</div>`; return; }
+  const state = opts.state || {};
+  const head = cols.map((c, idx) => c.sortable
+    ? `<th class="sortable" data-i="${idx}">${c.label} <span class="arrow">${state.i === idx ? (state.dir > 0 ? "▲" : "▼") : "↕"}</span></th>`
+    : `<th>${c.label}</th>`).join("");
+  const body = rows.map((r) => `<tr>${cols.map((c) => `<td class="${c.num ? "num" : ""}${c.mono ? " mono" : ""}">${c.render(r)}</td>`).join("")}</tr>`).join("");
+  el.innerHTML = `<thead><tr>${head}</tr></thead><tbody>${body}</tbody>`;
+  el.querySelectorAll("th.sortable").forEach((th) => {
+    th.onclick = () => {
+      const i = +th.dataset.i;
+      const dir = state.i === i ? -state.dir : 1;
+      const key = cols[i].sortKey || cols[i].render;
+      rows.sort((a, b) => {
+        const x = key(a), y = key(b);
+        return (x > y ? 1 : x < y ? -1 : 0) * dir;
+      });
+      table(el, cols, rows, { ...opts, state: { i, dir } });
+    };
+  });
+}
+
+function render(m) {
+  $("generated").textContent = "generated " + new Date(m.generated_at).toLocaleString();
+  $("disclaimer").innerHTML = `<strong>Controlled simulation.</strong> ${m.disclaimer.replace(/^Controlled simulation on a fixed synthetic seed - /, "")}`;
+
+  const rec = m.recovered, rate = m.recovery_rate;
+  const openOps = m.escalations_by_type.filter((e) => e.status === "open")
+    .reduce((s, e) => s + e.count, 0);
+
+  $("kpis").innerHTML = [
+    kpi({
+      label: "Rupees recovered (treatment − control)",
+      value: rupee(rec.delta), hero: true, unmeasured: !rec.computable,
+      positive: rec.computable && rec.delta > 0,
+      foot: rec.computable
+        ? `${rupee(rec.per_mandate_delta)} per mandate · arms ${rec.treatment_mandates}/${rec.control_mandates}`
+        : "no arm assignment recorded",
+    }),
+    kpi({
+      label: `Recovered within ${rate.sla_hours}h SLA`,
+      value: rate.rate == null ? "—" : (rate.rate * 100).toFixed(1) + "%",
+      unmeasured: rate.rate == null,
+      foot: `${fmtInt(rate.resolved_within_sla)} of ${fmtInt(rate.actions_total)} dispatched · ${fmtInt(rate.actions_in_flight)} in flight`,
+    }),
+    kpi({
+      label: "Actions dispatched",
+      value: fmtInt(rate.actions_total),
+      foot: `${fmtInt(rate.actions_resolved)} resolved`,
+    }),
+    kpi({
+      label: "Open Ops escalations",
+      value: fmtInt(openOps),
+      foot: openOps ? "awaiting human review" : "queue clear",
+    }),
+    kpi({
+      label: "Tier 3 quarantine",
+      value: fmtInt(m.quarantine.pending_ops_review),
+      foot: "unmapped strings pending review",
+    }),
+  ].join("");
+
+  $("recovered").innerHTML = rec.computable
+    ? barRows([
+        { name: "Treatment", value: rec.treatment_recovered, color: "var(--treatment)" },
+        { name: "Control", value: rec.control_recovered, color: "var(--control)" },
+      ], { format: rupee })
+    : `<div class="empty">${rec.note}</div>`;
+
+  const tierColor = { 1: "var(--tier-1)", 2: "var(--tier-2)", 3: "var(--tier-3)" };
+  $("mttr").innerHTML = m.mttr_by_tier.length
+    ? barRows(m.mttr_by_tier.map((t) => ({
+        name: `Tier ${t.tier}`,
+        value: t.mttr_seconds || 0,
+        color: tierColor[t.tier],
+        suffix: t.mttr_seconds == null
+          ? " — not measurable"
+          : ` · ${t.resolved_count} resolved, ${t.in_flight_count} in flight`,
+      })), { format: (v) => duration(v) || "—" })
+    : `<div class="empty">No diagnosed actions yet.</div>`;
+
+  $("actions").innerHTML = barRows(
+    m.actions_by_type.map((a) => ({ name: a.key, value: a.count, color: "var(--tier-2)" })),
+    { format: fmtInt });
+
+  $("ledger").innerHTML = barRows(
+    m.ledger_by_status.map((l) => ({ name: l.key, value: l.count, color: "var(--tier-2)" })),
+    { format: fmtInt });
+
+  table($("segments"), [
+    { label: "Segment", render: (r) => r.segment, sortable: true, sortKey: (r) => r.segment },
+    { label: "Checks", num: true, render: (r) => fmtInt(r.checks) },
+    { label: "Flags", num: true, render: (r) => fmtInt(r.flags), sortable: true, sortKey: (r) => r.flags },
+    { label: "Avg MAD", num: true, render: (r) => r.avg_mad == null ? "—" : r.avg_mad.toFixed(3) },
+    { label: "Threshold", num: true, render: (r) => r.threshold == null ? "—" : r.threshold.toFixed(3) },
+  ], m.detection.segments.slice(), { empty: "No detection runs recorded." });
+
+  const sev = (r) => r.status !== "open" ? "good" : (r.reason.includes("collision") ? "crit" : "warn");
+  table($("ops"), [
+    { label: "Source layer", render: (r) => r.source_layer, sortable: true, sortKey: (r) => r.source_layer },
+    { label: "Reason", mono: true, render: (r) => r.reason, sortable: true, sortKey: (r) => r.reason },
+    { label: "Status", render: (r) => `<span class="pill ${sev(r)}">${r.status}</span>`, sortable: true, sortKey: (r) => r.status },
+    { label: "Count", num: true, render: (r) => fmtInt(r.count), sortable: true, sortKey: (r) => r.count },
+  ], m.escalations_by_type.slice(), { empty: "Ops queue is empty — nothing escalated." });
+
+  table($("quarantine"), [
+    { label: "Event", mono: true, render: (r) => r.event_id },
+    { label: "Raw input", mono: true, render: (r) => r.raw_input },
+    { label: "Tier", num: true, render: (r) => r.tier_attempted },
+    { label: "Reason", render: (r) => r.reason },
+  ], m.quarantine.samples.slice(), { empty: "Quarantine is empty." });
+}
+
+fetch("/api/dashboard/summary")
+  .then((r) => { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+  .then(render)
+  .catch((e) => {
+    $("generated").textContent = "";
+    $("kpis").innerHTML = `<div class="card err"><div class="label">Could not load metrics</div>
+      <div class="foot">${e.message}. Is the API running, and has <code>scripts/seed_demo.py</code> been run?</div></div>`;
+  });
+</script>
+</body>
+</html>

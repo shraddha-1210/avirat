@@ -43,6 +43,61 @@ docker compose up -d db                            # Postgres for the pipeline +
   it (CI never hits the network).
 - **₹ Recovered is a controlled simulation** on a fixed synthetic seed.
 
+## Running the demo
+
+```bash
+docker compose up -d db
+.venv\Scripts\python scripts\seed_demo.py     # 240 events through the real pipeline
+.venv\Scripts\python -m uvicorn app:app        # dashboard at http://127.0.0.1:8000/
+```
+
+`seed_demo.py` uses a deterministic offline Tier 2 stub by default (no API key,
+no cost); pass `--live` for real Gemini calls. Note that **running pytest wipes
+the seeded data** — the DB fixtures truncate every table — so re-run the seeder
+before demoing.
+
+### Frontend (React + Vite + TypeScript)
+
+```bash
+npm install
+npm run build       # -> static/dist, served by FastAPI at /
+npm run dev         # or: Vite dev server on :5173, proxies /api to :8000
+```
+
+React 18 + Vite + TypeScript, shadcn/ui components (`src/components/ui/`),
+Tailwind, recharts and lucide-react. Five tabs: Overview, Ops Queue, Chaos
+Trigger, Reconciliation, Audit Trail.
+
+`static/dashboard.html` is kept as a **fallback** — FastAPI serves it when
+`static/dist/` is absent, so `uvicorn app:app` still works on a machine that has
+never run `npm install`.
+
+The Chaos Trigger drives the real pipeline with the three existing endpoints in
+sequence (`/api/events/ingest` -> `/api/events/recover` -> `/api/webhooks/settlement`),
+lighting each stage as its call returns. Nothing is simulated client-side.
+
+### Metrics that refuse to flatter
+
+Layer 6 returns `None` with a stated reason where a number cannot honestly be
+computed, because a `0` on a dashboard reads as a measurement:
+
+- **MTTR excludes in-flight actions.** An unresolved action has taken an unknown
+  time, not zero. Averaging it in as 0 would make MTTR *fall* as the backlog
+  grows.
+- **Recovery rate divides by all dispatched actions**, not just resolved ones,
+  so a growing backlog cannot flatter the percentage.
+- **Rupees Recovered reports arm sizes and a per-mandate delta** beside the raw
+  Treatment − Control subtraction, because that subtraction is only a lift when
+  the arms are comparable.
+- **Refunded collisions never count as revenue.** Counting both sides of a
+  collision would report a double-charge as double income.
+- **No arm assignment reports `computable: false`**, not `0` — which would be
+  indistinguishable from "the intervention did nothing".
+
+The control arm's baseline is a stated simulation assumption: transient causes
+(`bank_downtime`, `technical_decline`) self-heal without intervention. Without
+that baseline, Treatment − Control would just restate Treatment.
+
 ## Idempotency proof (Layer 4c)
 
 The core robustness claim: **a duplicate webhook can never double-charge.**

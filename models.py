@@ -103,6 +103,10 @@ class ActionsLog(Base):
     params: Mapped[dict] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(24), default="processing")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    # Set when the action reaches ANY terminal state (settled, refunded,
+    # escalated). Layer 6 measures MTTR off this, so an action that is still
+    # in flight is excluded from the mean rather than counted as instant.
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class ReconciliationLedger(Base):

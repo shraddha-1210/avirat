@@ -177,6 +177,58 @@ def call_tier2_llm(sanitized_error: str, *, model: str | None = None) -> str:
     return response.text or ""
 
 
+class OntologyPromotionError(ValueError):
+    """A promotion was refused. Carries a message safe to return to the caller."""
+
+
+def promote_to_tier1(raw_input: str, target_cause: str) -> dict:
+    """Add a learned mapping to the Tier 1 rule dict. Closes the ontology loop.
+
+    A string that fell to Tier 3 is reviewed by Ops, mapped to a real cause, and
+    from then on resolves instantly at Tier 1 with no LLM call. That is the whole
+    point of quarantining rather than guessing.
+
+    The key is normalised the same way `diagnose_tier1` looks it up (stripped,
+    upper-cased), otherwise a promoted rule would never match.
+
+    DEMO SCOPE: this mutates the in-process dict, so it does not survive a
+    restart. A production build would persist the rule and reload it at startup,
+    with an audit record of who approved it.
+    """
+    raw = str(raw_input).strip()
+    if not raw:
+        raise OntologyPromotionError("raw_input must not be empty")
+
+    cause = str(target_cause).strip()
+    if cause not in ONTOLOGY_SET:
+        raise OntologyPromotionError(
+            f"target_cause {cause!r} is not in the ontology; allowed: "
+            + ", ".join(sorted(ONTOLOGY_SET))
+        )
+    if cause in _NON_RESOLVING_CAUSES:
+        # A Tier 1 rule marks its result `resolved` with confidence 1.0. Mapping
+        # to 'unknown' would therefore assert we confidently know it is unknown,
+        # which is a contradiction — and would bypass the quarantine that exists
+        # precisely for these strings.
+        raise OntologyPromotionError(
+            f"cannot promote to {cause!r} — a Tier 1 rule resolves with confidence 1.0, "
+            "so mapping to a non-resolving cause would silently skip quarantine"
+        )
+
+    key = raw.upper()
+    previous = TIER1_RULES.get(key)
+    TIER1_RULES[key] = cause
+    logger.info(
+        "ontology promotion: %r -> %r (previously %r)", key, cause, previous
+    )
+    return {
+        "key": key,
+        "target_cause": cause,
+        "previous_cause": previous,
+        "rules_count": len(TIER1_RULES),
+    }
+
+
 def diagnose_tier1(raw_error_code: str) -> DiagnosisResult | None:
     """Exact-match lookup. Returns None if the code is not a known one."""
     key = str(raw_error_code).strip().upper()
