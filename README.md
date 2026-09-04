@@ -2,6 +2,8 @@
 
 **Catch UPI AutoPay mandates before they die, not after.**
 
+[![CI](https://github.com/shraddha-1210/avirat/actions/workflows/ci.yml/badge.svg)](https://github.com/shraddha-1210/avirat/actions/workflows/ci.yml)
+
 ## The problem
 
 A UPI AutoPay mandate rarely fails loudly. It fails once for a recoverable reason — the bank
