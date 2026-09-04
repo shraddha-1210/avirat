@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+# A newer push to the same branch supersedes an in-flight run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: Backend tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # NOT a `services:` block, deliberately. The idempotency burst opens 100
+      # genuinely concurrent connections (each one established before the
+      # threading.Barrier releases), so it needs the same max_connections=250
+      # docker-compose.yml sets. GitHub service containers cannot override a
+      # container's command, so the flag is unreachable there and the burst
+      # would die on "too many clients already". Everything else matches
+      # docker-compose.yml; tmpfs is dropped because the runner is ephemeral.
+      - name: Start PostgreSQL 16
+        run: |
+          docker run -d --name avirata-db \
+            -e POSTGRES_USER=avirata \
+            -e POSTGRES_PASSWORD=avirata \
+            -e POSTGRES_DB=avirata \
+            -p 5432:5432 \
+            postgres:16-alpine \
+            -c max_connections=250
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Wait for PostgreSQL
+        run: |
+          for _ in $(seq 1 30); do
+            if docker exec avirata-db pg_isready -U avirata -d avirata; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::PostgreSQL did not become ready"
+          docker logs avirata-db
+          exit 1
+
+      # The DB-backed tests SKIP when Postgres is unreachable rather than fail,
+      # which is right locally and wrong in CI: it would turn a broken database
+      # into a green run that proves nothing. Fail here instead, loudly.
+      - name: Assert Postgres is reachable
+        env:
+          DATABASE_URL: postgresql+psycopg://avirata:avirata@localhost:5432/avirata
+        run: |
+          python - <<'PY'
+          from sqlalchemy import text
+          from db import get_engine
+          with get_engine().connect() as conn:
+              print("connected:", conn.execute(text("select version()")).scalar())
+          PY
+
+      # Tier 2 is mocked in every test by tests/conftest.py, so no API key and
+      # no network. `-rs` prints the reason for any skip.
+      - name: Run pytest
+        env:
+          DATABASE_URL: postgresql+psycopg://avirata:avirata@localhost:5432/avirata
+        run: pytest -rs
+
+  frontend:
+    name: Frontend build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+
+      # Vite writes to ../static/dist so FastAPI can serve it from the repo
+      # root. If that path ever drifts, the API still boots and silently falls
+      # back to the pre-React page, so assert the bundle actually landed.
+      - name: Confirm static/dist was produced
+        run: |
+          test -f static/dist/index.html
+          test -d static/dist/assets
+          ls -la static/dist static/dist/assets
