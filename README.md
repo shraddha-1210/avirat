@@ -2,8 +2,155 @@
 
 **Catch UPI AutoPay mandates before they die, not after.**
 
-Screenshots below come from a `--big` seed (600 events). The figures quoted under
-*What actually works* are from the default 240-event run, so the two sets of numbers differ.
+## The problem
+
+A UPI AutoPay mandate rarely fails loudly. It fails once for a recoverable reason — the bank
+was down for ten minutes, the payer's balance was short at 3am, an authentication window
+timed out — and nobody notices, because a single decline looks like noise. By the time the
+pattern is obvious the mandate is revoked, the customer has churned, and the revenue is gone
+without a single support ticket being raised.
+
+The industry default is to retry failed payments after the fact. That misses the window that
+matters: the gap between *the first decline that had a fixable cause* and *the mandate going
+permanently dead*. Recovery inside that gap is cheap and usually invisible to the customer.
+Recovery after it is a win-back campaign.
+
+## The approach
+
+The pipeline runs in one pass — detect, diagnose, policy, reconcile, measure, learn — and
+every decision that moves money is deterministic and re-derivable by hand: a weighted
+scorecard with published weights, not a model. The LLM is confined to one job: mapping an
+ambiguous free-text decline string into a fixed ontology of seven causes. It classifies; it
+never dispatches, never authorises, and never decides an amount. Anything it cannot map with
+confidence is quarantined for a human rather than guessed at.
+
+Everything is measured against a randomised control arm on the same seeded dataset, so the
+headline recovery figure is a difference against a counterfactual rather than a restatement
+of gross collections.
+
+## Architecture
+
+Seven layers because each one is a distinct place a recovery system goes wrong, and keeping
+them apart means each failure mode can be tested on its own — a detection bug cannot quietly
+turn into a dispatch bug. The split down the middle is the point: layers 1, 2, 4, 5 and 6 are
+arithmetic with no model anywhere in them, and the LLM lives only inside layer 3, where the
+input is free text and the output is one of seven fixed labels. That containment is what
+keeps the money path re-derivable by hand — the model can be wrong about a cause, but it
+cannot be wrong about an amount, a rail, or whether to charge at all. Layer 7 is drawn as a
+separate loop rather than an arrow buried inside layer 3 because promotion is not automatic:
+a human approves a quarantined string before it becomes a Tier 1 rule, so the ontology only
+grows through a decision someone signed off on. A system that rewrote its own classification
+rules mid-run would be faster and much harder to audit.
+
+```mermaid
+flowchart TD
+    W["Bank / PSP webhook"]
+    L1["<b>1 · Ingestion</b><br/>seeded events · treatment / control split"]
+    L2["<b>2 · Detection</b><br/>MAD anomaly · N ≥ 30 hard gate"]
+    L3["<b>3 · Diagnosis</b><br/>Tier 1 rules → Tier 2 Gemini → Tier 3 quarantine"]
+    L4["<b>4 · Policy</b><br/>risk scorecard · idempotent dispatch"]
+    L5["<b>5 · Reconciliation</b><br/>settlement hold · collision auto-refund"]
+    L6["<b>6 · Metrics</b><br/>MTTR · recovered vs control · audit trail"]
+    L7["<b>7 · Learn</b><br/>Ops approves a quarantined mapping"]
+
+    W --> L1
+    L1 --> L2
+    L2 --> L3
+    L3 --> L4
+    L4 --> L5
+    L5 --> L6
+    L6 --> L7
+    L7 -. "promoted rule<br/>becomes a Tier 1 rule" .-> L3
+
+    classDef stage fill:#f6f8fa,stroke:#57606a,stroke-width:1px,color:#1f2328;
+    classDef edge_in fill:#fff,stroke:#8c959f,stroke-dasharray:3 3,color:#1f2328;
+    classDef learn fill:#fff8e6,stroke:#bf8700,stroke-width:1px,color:#1f2328;
+    class L1,L2,L3,L4,L5,L6 stage;
+    class W edge_in;
+    class L7 learn;
+
+    linkStyle 7 stroke:#bf8700,stroke-width:1.5px;
+```
+
+What each layer owns, and the specific failure it exists to prevent:
+
+- **1 · Ingestion** — `layers/ingestion.py`
+  A seeded generator produces the decline stream from a weighted cause distribution and a
+  real cause → raw-code mapping. Several causes emit more than one code, which is the
+  ambiguity Tier 2 has to resolve, and `unknown` emits genuinely novel strings that must fall
+  through to quarantine. `true_cause` is generated here as a hidden column and stripped by
+  `to_downstream_payload()` before anything downstream sees it — Detection and Diagnosis only
+  ever receive `raw_error_code`, and the label is rejoined at Layer 6 to score them. Mandates
+  are split 50/50 into treatment and control, whole mandates only so none straddles an arm.
+
+- **2 · Detection** — `layers/detection.py`
+  Median Absolute Deviation over daily decline counts per `(bank, mandate_type)` segment. Two
+  gates run before any conclusion: sample size `N ≥ 30` is checked *before* the MAD math, so a
+  thin segment returns `insufficient_data` with `mad=None` rather than a false spike; and
+  dispersion is floored at one whole decline event, because the MAD of a count series is
+  legitimately 0 when most days share a value and a 0 threshold would flag every +1 day. The
+  MAD is unscaled — no 1.4826 constant — so `threshold` reads directly as "this many decline
+  events from the median". Every call returns median, MAD, threshold and deviation, so a flag
+  can be re-derived by hand.
+
+- **3 · Diagnosis** — `layers/diagnosis.py`
+  The only layer with a model in it, structured as a cascade that tries to avoid using it.
+  Tier 1 is a dict lookup against `TIER1_RULES` — instant, no network, confidence 1.0. Tier 2
+  is the Gemini call, and everything around it is defensive: the raw string is stripped of
+  HTML, control characters and SQL metacharacters and capped at 200 chars before prompt
+  assembly, the call runs at temperature 0 with `response_mime_type="application/json"`, and
+  the reply is parsed against a strict `extra="forbid"` schema. Tier 3 catches everything
+  else — a parse failure, a schema violation, a cause outside the ontology, or confidence
+  below 0.85 — and quarantines it as a recorded outcome rather than a dropped event.
+
+- **4 · Policy** — `layers/recovery_policy.py`
+  Five sub-parts, deliberately separable:
+  - *4a scorecard* — four normalised signals (urgency, unreliability, amount tier, cost-benefit)
+    against published weights summing to 1.0, with every component returned alongside the total.
+  - *4b action map* — a fixed table: `bank_downtime`/`technical_decline` → RETRY,
+    `insufficient_funds`/`payer_limit_exceeded` → NUDGE_BALANCE, `mandate_revoked`/
+    `mandate_paused`/`authentication_failure` → ALT_RAIL. A cause absent from the table is not
+    guessed at; it becomes MANUAL_REVIEW, which is a person rather than a payment.
+  - *4c dispatch* — the alt rail needs two independent gates to pass, score `≥ 0.60` **and**
+    expected loss above the ₹1,600 attempt cost, reported separately so neither can carry the
+    other. Firing goes through `UNIQUE (mandate_id, billing_cycle)` with
+    `ON CONFLICT DO NOTHING RETURNING`, so a replayed webhook writes nothing.
+  - *4d comms mutex* (`layers/comms_orchestrator.py`) — a `communication_state` row, not an
+    in-process flag, stops the standard reminder job contradicting an alt-rail payment link
+    the customer is already holding.
+  - *4e TTL watchdog* (`tasks/ttl_watchdog.py`) — anything left in `processing` past its
+    window moves to `manual_escalation` and onto the Ops queue.
+
+- **5 · Reconciliation** — `layers/reconciliation.py`
+  The hold opens at dispatch, not at settlement, so a collision arriving before any webhook
+  still has something to collide with. Settlement is attempted inside a SAVEPOINT: the partial
+  unique index `UNIQUE (mandate_id, billing_cycle) WHERE status = 'settled'` rejects the second
+  path, and that `IntegrityError` *is* the collision signal — caught and converted into an
+  auto-refund without poisoning the caller's transaction. Keys end in one of four states —
+  `settled`, `auto_refunded`, `expired_escalated`, `closed_superseded` — and the expiry sweep
+  separates "nothing settled, a human must look" from "a sibling path already settled, close
+  it quietly", because escalating the second kind would bury the first in noise.
+
+- **6 · Metrics** — `layers/metrics.py`
+  Aggregation over what the pipeline actually recorded, with two honesty rules built into the
+  shape of the module. MTTR excludes in-flight actions, because an unresolved action has taken
+  an unknown time rather than zero, and counting it as zero would make MTTR *fall* as the
+  backlog grows. Where a metric cannot be computed honestly — no resolved actions, an empty
+  control arm — it returns `None` with a stated reason, since a zero on a dashboard reads as a
+  measurement while `None` reads as "not measured".
+
+- **7 · Learn** — `promote_to_tier1()` in `layers/diagnosis.py`, exposed at `/api/ontology/promote`
+  An operator reviewing the Ops queue maps a quarantined string to a cause; that writes a
+  Tier 1 rule, and the next event carrying the identical string resolves instantly with no LLM
+  call. This is the only path by which the ontology grows, and it runs through a human on
+  purpose. Demo scope, stated plainly: the rule lives in the process's `TIER1_RULES` dict, does
+  not survive a restart, and records no approver — production would persist it with an audit
+  record naming who signed off.
+
+## Screenshots
+
+> Taken from a `--big` seed (600 events). The figures under *What actually works* below come
+> from the default 240-event run, so the two sets of numbers differ.
 
 ### Overview
 
@@ -60,37 +207,6 @@ arithmetic attached: score 0.048 against a 0.60 threshold, expected loss ₹79.6
 ₹1,600 to run the alt rail. Nothing ever settled on it, so the TTL watchdog escalated it at
 10:58 PM; the raw `GET /api/audit/decision/...` response sits below the trace.
 
----
-
-## The problem
-
-A UPI AutoPay mandate rarely fails loudly. It fails once for a recoverable reason — the bank
-was down for ten minutes, the payer's balance was short at 3am, an authentication window
-timed out — and nobody notices, because a single decline looks like noise. By the time the
-pattern is obvious the mandate is revoked, the customer has churned, and the revenue is gone
-without a single support ticket being raised.
-
-The industry default is to retry failed payments after the fact. That misses the window that
-matters: the gap between *the first decline that had a fixable cause* and *the mandate going
-permanently dead*. Recovery inside that gap is cheap and usually invisible to the customer.
-Recovery after it is a win-back campaign.
-
-## The approach
-
-Every decision that moves money is deterministic and re-derivable by hand — a weighted
-scorecard with published weights, not a model. The LLM is confined to one job: mapping an
-ambiguous free-text decline string into a fixed ontology of seven causes. It classifies; it
-never dispatches, never authorises, and never decides an amount. Anything it cannot map with
-confidence is quarantined for a human rather than guessed at.
-
-Everything is measured against a randomised control arm on the same seeded dataset, so the
-headline recovery figure is a difference against a counterfactual rather than a restatement
-of gross collections.
-
-```
-Detect → Diagnose → Policy → Reconcile → Measure → Learn
-```
-
 ## What actually works
 
 Every number below is produced by code in this repo and reproducible from a fixed seed.
@@ -134,38 +250,6 @@ application would have missed.
 **The ontology loop closes, verified live end to end:** a novel decline code quarantines at
 Tier 3 → an operator approves a mapping in the Ops Queue → the identical string on the next
 event resolves at **Tier 1 with confidence 1.0 and no LLM call at all**.
-
-## Architecture
-
-```mermaid
-flowchart TD
-    W["Bank / PSP webhook"]
-    L1["<b>1 · Ingestion</b><br/>seeded events · treatment / control split"]
-    L2["<b>2 · Detection</b><br/>MAD anomaly · N ≥ 30 hard gate"]
-    L3["<b>3 · Diagnosis</b><br/>Tier 1 rules → Tier 2 Gemini → Tier 3 quarantine"]
-    L4["<b>4 · Policy</b><br/>risk scorecard · idempotent dispatch"]
-    L5["<b>5 · Reconciliation</b><br/>settlement hold · collision auto-refund"]
-    L6["<b>6 · Metrics</b><br/>MTTR · recovered vs control · audit trail"]
-    L7["<b>7 · Learn</b><br/>Ops approves a quarantined mapping"]
-
-    W --> L1
-    L1 --> L2
-    L2 --> L3
-    L3 --> L4
-    L4 --> L5
-    L5 --> L6
-    L6 --> L7
-    L7 -. "promoted rule<br/>becomes a Tier 1 rule" .-> L3
-
-    classDef stage fill:#f6f8fa,stroke:#57606a,stroke-width:1px,color:#1f2328;
-    classDef edge_in fill:#fff,stroke:#8c959f,stroke-dasharray:3 3,color:#1f2328;
-    classDef learn fill:#fff8e6,stroke:#bf8700,stroke-width:1px,color:#1f2328;
-    class L1,L2,L3,L4,L5,L6 stage;
-    class W edge_in;
-    class L7 learn;
-
-    linkStyle 7 stroke:#bf8700,stroke-width:1.5px;
-```
 
 ## Guardrails that made the cut
 
