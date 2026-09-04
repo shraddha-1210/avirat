@@ -2,6 +2,10 @@
 
 **Catch UPI AutoPay mandates before they die, not after.**
 
+| Overview | Chaos trigger | Reconciliation |
+| :---: | :---: | :---: |
+| ![Dashboard overview — MTTR, ₹ recovered vs control, SLA rate](docs/screenshots/overview.png) | ![Chaos console — injecting a duplicate settlement](docs/screenshots/chaos-trigger.png) | ![Reconciliation — collision cards, winner and auto-refunded rail](docs/screenshots/reconciliation.png) |
+
 ---
 
 ## The problem
@@ -81,42 +85,32 @@ event resolves at **Tier 1 with confidence 1.0 and no LLM call at all**.
 
 ```mermaid
 flowchart TD
-    W["Bank / PSP webhook"] --> L1
+    W["Bank / PSP webhook"]
+    L1["<b>1 · Ingestion</b><br/>seeded events · treatment / control split"]
+    L2["<b>2 · Detection</b><br/>MAD anomaly · N ≥ 30 hard gate"]
+    L3["<b>3 · Diagnosis</b><br/>Tier 1 rules → Tier 2 Gemini → Tier 3 quarantine"]
+    L4["<b>4 · Policy</b><br/>risk scorecard · idempotent dispatch"]
+    L5["<b>5 · Reconciliation</b><br/>settlement hold · collision auto-refund"]
+    L6["<b>6 · Metrics</b><br/>MTTR · recovered vs control · audit trail"]
+    L7["<b>7 · Learn</b><br/>Ops approves a quarantined mapping"]
 
-    subgraph L1["1 · Ingestion"]
-        A["Seeded event generator<br/>hidden ground truth<br/>50/50 treatment / control split"]
-    end
+    W --> L1
+    L1 --> L2
+    L2 --> L3
+    L3 --> L4
+    L4 --> L5
+    L5 --> L6
+    L6 --> L7
+    L7 -. "promoted rule<br/>becomes a Tier 1 rule" .-> L3
 
-    subgraph L2["2 · Detection"]
-        B["MAD anomaly per bank × mandate type<br/>N ≥ 30 hard gate<br/>explicit insufficient_data"]
-    end
+    classDef stage fill:#f6f8fa,stroke:#57606a,stroke-width:1px,color:#1f2328;
+    classDef edge_in fill:#fff,stroke:#8c959f,stroke-dasharray:3 3,color:#1f2328;
+    classDef learn fill:#fff8e6,stroke:#bf8700,stroke-width:1px,color:#1f2328;
+    class L1,L2,L3,L4,L5,L6 stage;
+    class W edge_in;
+    class L7 learn;
 
-    subgraph L3["3 · Diagnosis"]
-        C1["Tier 1 · rule dict<br/>instant, no LLM"]
-        C2["Tier 2 · Gemini<br/>sanitize → call → validate → confidence gate"]
-        C3["Tier 3 · quarantine<br/>Ops review queue"]
-        C1 -->|"no match"| C2
-        C2 -->|"unmappable / low confidence"| C3
-    end
-
-    subgraph L4["4 · Recovery policy"]
-        D1["Weighted risk scorecard"]
-        D2["Cause → action map<br/>RETRY · NUDGE · ALT_RAIL · SAFE_HOLD"]
-        D3["Idempotent dispatch<br/>Postgres UNIQUE + ON CONFLICT"]
-        D4["Comms mutex · TTL watchdog"]
-        D1 --> D2 --> D3 --> D4
-    end
-
-    subgraph L5["5 · Reconciliation"]
-        E["Settlement-hold window<br/>partial unique index — one settled row per key<br/>collision → auto-refund"]
-    end
-
-    subgraph L6["6 · Metrics & dashboard"]
-        F["MTTR · ₹ recovered vs control<br/>SLA rate · Ops queue · audit trace"]
-    end
-
-    L1 --> L2 --> L3 --> L4 --> L5 --> L6
-    L6 -.->|"7 · Learn — approved mapping becomes a Tier 1 rule"| C1
+    linkStyle 7 stroke:#bf8700,stroke-width:1.5px;
 ```
 
 ## Guardrails that made the cut
@@ -183,9 +177,10 @@ Get a Gemini API key at **https://aistudio.google.com/apikey**.
 ```
 
 Omit `--live` to seed with a deterministic offline Tier 2 stub — no API key, no cost, same
-numbers. The frontend is pre-built into `static/dist`; to rebuild it:
+numbers. The frontend lives in `frontend/` and builds into `static/dist`, which FastAPI serves:
 
 ```bash
+cd frontend
 npm install && npm run build      # or: npm run dev  (Vite on :5173, proxies /api to :8000)
 ```
 

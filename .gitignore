@@ -6,6 +6,9 @@ __pycache__/
 *.egg-info/
 .coverage
 
-# Frontend
+# Frontend — the app lives in frontend/, but its build output goes to
+# static/dist/ at the repo root because that is what FastAPI serves.
 node_modules/
+frontend/node_modules/
 static/dist/
+*.tsbuildinfo

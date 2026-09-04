@@ -1,11 +1,16 @@
-r"""Drive the seeded 240-event dataset through the whole pipeline into Postgres.
+r"""Drive the seeded decline-event dataset through the whole pipeline into Postgres.
 
 Gives Layer 6 something real to measure. Every row the dashboard shows is
 produced by the actual layers — ingestion -> detection -> diagnosis -> policy ->
 idempotent dispatch -> reconciliation — not by fixtures written to look plausible.
 
     docker compose up -d db
-    .venv\Scripts\python scripts\seed_demo.py
+    .venv\Scripts\python scripts\seed_demo.py            # 240 events (default)
+    .venv\Scripts\python scripts\seed_demo.py --big      # 600 events, for screenshots
+
+`--big` only turns the same crank harder: a larger seeded draw from the SAME
+generator, and proportionally more of the failure paths exercised through the
+SAME layer functions. No row is written by hand at either size.
 
 By default Tier 2 uses a DETERMINISTIC OFFLINE STUB so the seeder is free and
 reproducible; pass --live to make real Gemini calls instead (needs
@@ -21,6 +26,7 @@ import argparse
 import json
 import sys
 import zlib
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 sys.path.insert(0, ".")
@@ -85,13 +91,53 @@ def _stub_llm(sanitized_error: str, *, model: str | None = None) -> str:
     return json.dumps({"cause": cause, "confidence": confidence, "rationale": "offline stub"})
 
 
+# --- demo scale profiles -----------------------------------------------------
+#
+# Two sizes of the SAME run. `--big` exists so the dashboard screenshots show a
+# populated Ops queue and a Reconciliation wall rather than a handful of rows —
+# it changes how much of the dataset is drawn and how many keys the failure
+# paths are exercised on, and nothing else. Both profiles go through identical
+# code; there is no branch anywhere below that writes a row `--big` alone would
+# produce.
+#
+# `collision_keys` / `stuck_actions` are how many already-settled keys get a
+# second collection attempt, and how many in-flight actions get backdated past
+# the TTL. They are counts of REAL keys drawn from the ledger and the actions
+# log — the collision and the escalation are still decided by the partial unique
+# index and by `sweep_stuck_actions()` respectively, not asserted here.
+#
+# Quarantine volume is deliberately NOT in this table. Quarantines come from the
+# `unknown`-cause events the generator emits (~3% of the stream, treatment arm
+# only), so the count scales with `n` on its own. Pinning it to a target would
+# mean manufacturing quarantines the diagnosis layer never actually produced.
+
+
+@dataclass(frozen=True)
+class DemoScale:
+    """How much of the pipeline one seeding run exercises."""
+
+    name: str
+    n: int
+    collision_keys: int
+    stuck_actions: int
+
+
+_SMALL = DemoScale(name="default", n=settings.dataset_n, collision_keys=8, stuck_actions=5)
+_BIG = DemoScale(name="big", n=600, collision_keys=20, stuck_actions=15)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--live", action="store_true",
                         help="use the real Gemini Tier 2 call instead of the offline stub")
     parser.add_argument("--keep", action="store_true",
                         help="append to existing data instead of resetting the schema")
+    parser.add_argument("--big", action="store_true",
+                        help="seed ~600 events instead of 240, with proportionally more "
+                             "collisions / TTL escalations, for dashboard screenshots")
     args = parser.parse_args()
+
+    scale = _BIG if args.big else _SMALL
 
     if not args.live:
         diagnosis_module.call_tier2_llm = _stub_llm
@@ -106,7 +152,7 @@ def main() -> int:
         Base.metadata.drop_all(bind=get_engine())
     init_db()
 
-    df = generate_events(settings.dataset_n, settings.dataset_seed)
+    df = generate_events(scale.n, settings.dataset_seed)
     treatment, _control = split_treatment_control(df, settings.dataset_seed)
     treatment_mandates = set(treatment["mandate_id"])
     df = df.copy()
@@ -118,7 +164,7 @@ def main() -> int:
     next_cycle = (ts.dt.to_period("M") + 1).dt.to_timestamp(how="start")
     df["days_to_next_cycle"] = (next_cycle - ts).dt.days.clip(lower=0)
 
-    print(f"dataset: n={len(df)} seed={settings.dataset_seed}  "
+    print(f"dataset: n={len(df)} seed={settings.dataset_seed} scale={scale.name}  "
           f"treatment={int((df['arm'] == 'treatment').sum())} "
           f"control={int((df['arm'] == 'control').sum())}")
 
@@ -234,7 +280,7 @@ def main() -> int:
             select(ReconciliationLedger.mandate_id, ReconciliationLedger.billing_cycle,
                    ReconciliationLedger.path, ReconciliationLedger.amount)
             .where(ReconciliationLedger.status == "settled")
-            .limit(8)
+            .limit(scale.collision_keys)
         ).all()
         collisions = 0
         for m_id, b_cycle, path, amt in settled_keys:
@@ -249,7 +295,7 @@ def main() -> int:
 
         # 2. Stuck actions: backdate a few past the TTL, then run the real sweep.
         stuck = session.execute(
-            select(ActionsLog).where(ActionsLog.resolved_at.is_(None)).limit(5)
+            select(ActionsLog).where(ActionsLog.resolved_at.is_(None)).limit(scale.stuck_actions)
         ).scalars().all()
         for a in stuck:
             a.created_at = datetime.now(timezone.utc) - timedelta(
