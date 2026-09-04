@@ -2,9 +2,63 @@
 
 **Catch UPI AutoPay mandates before they die, not after.**
 
-| Overview | Chaos trigger | Reconciliation |
-| :---: | :---: | :---: |
-| ![Dashboard overview — MTTR, ₹ recovered vs control, SLA rate](docs/screenshots/overview.png) | ![Chaos console — injecting a duplicate settlement](docs/screenshots/chaos-trigger.png) | ![Reconciliation — collision cards, winner and auto-refunded rail](docs/screenshots/reconciliation.png) |
+Screenshots below come from a `--big` seed (600 events). The figures quoted under
+*What actually works* are from the default 240-event run, so the two sets of numbers differ.
+
+### Overview
+
+![Overview tab — recovered vs control, SLA rate, MTTR by tier, anomaly table](docs/screenshots/dashboard.png)
+
+The headline ₹60,144 is treatment minus control (₹3,97,887 against ₹3,37,743), not gross
+collections — the arms hold 144 and 145 mandates, so ₹434 per mandate is the comparable
+figure. MTTR is split by diagnosis tier (16.7h / 15.8h / 12.9h) and counts only actions that
+reached a terminal state; the 43 still in flight are excluded rather than counted as zero,
+which would drag the average down. The anomaly table applies the N ≥ 30 gate per segment
+before computing any MAD, so a thin segment reports `insufficient_data` instead of a spike.
+
+### Ops Queue
+
+![Ops Queue — safe holds, manual reviews and quarantined strings with risk and SLA columns](docs/screenshots/ops_queue.png)
+
+90 cases the pipeline decided not to act on by itself: SAFE_HOLD and MANUAL_REVIEW actions,
+plus 17 decline strings that fell to Tier 3 quarantine. Every row carries the risk score that
+produced it and its own SLA clock — 22.8h remaining here, 0 breached. Approving a quarantined
+string writes a Tier 1 rule, which is where the 10 Tier 1 rules in the counter above came
+from; the next event carrying that string resolves with no LLM call.
+
+### Chaos trigger
+
+![Chaos trigger — injecting MYSTERIOUS_FAILURE_XYZ and the four-stage pipeline trace](docs/screenshots/chaos_trigger.png)
+
+Pushes one synthetic decline through the real endpoints and shows each stage as it returns;
+the preset row includes `<script>alert(1)</script>` to exercise sanitization. Here
+`MYSTERIOUS_FAILURE_XYZ` at ₹4,800 clears Detect as normal (N=60, MAD 1.000), then fails to
+map at Tier 2 and quarantines at confidence 0.10. Policy is the part worth reading: risk
+scored 0.808 and the cost-benefit check passed (expected loss ₹1,920 against ₹1,600 to run
+the alt rail), and it still returned MANUAL_REVIEW rather than move money, because an
+undiagnosed failure is not something to act on — Reconcile is skipped for the same reason.
+
+### Reconciliation
+
+![Reconciliation — 20 collision cards, each showing the settled rail and the refunded one](docs/screenshots/reconciliation.png)
+
+Every key where both rails opened a hold: 20 in this run, all 20 closed by refunding the
+loser, against 222 settled rows overall. Each card shows both ledger rows for one key — the
+mandate rail settled, the alt rail hit `UNIQUE (mandate_id, billing_cycle) WHERE status =
+'settled'` and was auto-refunded for the identical amount. The gaps run from 63 minutes to
+34.8 hours, far outside the 300-second hold window, which is the case a `SELECT`-then-`UPDATE`
+check tends to miss.
+
+### Audit trail
+
+![Audit trail — decision trace for MND-00271, from decline event through TTL escalation](docs/screenshots/audit.png)
+
+One key's whole history, assembled from what each layer recorded at the time rather than
+reconstructed afterwards. MND-00271 / 2026-08 declined with `U54`, resolved at Tier 1 as
+`authentication_failure` at confidence 1.00 with no LLM call, then took SAFE_HOLD with the
+arithmetic attached: score 0.048 against a 0.60 threshold, expected loss ₹79.60 against
+₹1,600 to run the alt rail. Nothing ever settled on it, so the TTL watchdog escalated it at
+10:58 PM; the raw `GET /api/audit/decision/...` response sits below the trace.
 
 ---
 
@@ -44,8 +98,8 @@ Every number below is produced by code in this repo and reproducible from a fixe
 **126 tests pass.** The database-backed tests run against real PostgreSQL 16 — the
 idempotency and reconciliation guarantees are constraint behaviour, so testing them against
 SQLite or a mocked lock would prove nothing. If Postgres is unreachable those 25 tests *skip
-loudly* rather than passing vacuously. The Tier 2 LLM call is mocked in every test by design;
-CI never touches the network.
+loudly* rather than passing vacuously. The Tier 2 LLM call is mocked in every test; CI never
+touches the network.
 
 **Diagnosis: 240/240 correct outcomes on the seeded corpus.** 232 events carried a
 resolvable cause and all 232 were classified correctly, with zero wrong causes. The other 8
@@ -116,26 +170,26 @@ flowchart TD
 ## Guardrails that made the cut
 
 - **No ML on money movement.** The LLM classifies into a fixed ontology and nothing else. The
-  risk scorecard is four weighted signals summing to 1.0, each returned alongside the total so
-  any decision can be re-derived by hand in an audit.
+  risk scorecard in `layers/recovery_policy.py` is four weighted signals summing to 1.0, each
+  returned alongside the total so any decision can be re-derived by hand in an audit.
 - **Sanitize in, schema-validate out.** Decline strings arrive from an untrusted webhook, so
-  HTML tags, control characters and SQL metacharacters are stripped and the string is capped
-  before prompt assembly. The reply is parsed against a strict `extra="forbid"` schema. A
-  parse failure, a schema violation, an off-ontology cause or low confidence all route to
-  quarantine — never a crash, never a silent default.
+  `layers/diagnosis.py` strips HTML tags, control characters and SQL metacharacters and caps
+  the string at 200 chars before prompt assembly. The reply is parsed against a strict
+  `extra="forbid"` schema. A parse failure, a schema violation, an off-ontology cause or low
+  confidence all route to quarantine — never a crash, never a silent default.
 - **Idempotency is a database constraint, not an application lock.** `UNIQUE (mandate_id,
   billing_cycle)` plus `INSERT ... ON CONFLICT DO NOTHING RETURNING`. There is no
   read-then-write window to lose.
-- **Every case terminates in a defined state.** A TTL watchdog sweeps anything stuck in
-  `processing` past its window into `manual_escalation` and onto the Ops queue. Nothing sits
-  invisible forever.
+- **Every case terminates in a defined state.** The TTL watchdog in `tasks/ttl_watchdog.py`
+  sweeps anything stuck in `processing` past its window into `manual_escalation` and onto the
+  Ops queue. Nothing sits invisible forever.
 - **The cost-benefit gate is genuinely reachable.** It initially was not — under the shipped
   weights the risk gate always tripped first, making the second gate dead code. It was retuned
   (`risk_weight_amount` 0.4→0.5, `ALT_RAIL_COST_RUPEES` 12→1600) until it independently blocks
   real events, and `test_cost_benefit_gate_is_reachable` fails if a future retune kills it
   again.
-- **Sparse data never produces a false anomaly.** MAD detection checks `N ≥ 30` before any
-  arithmetic and returns an explicit `insufficient_data` status.
+- **Sparse data never produces a false anomaly.** MAD detection in `layers/detection.py`
+  checks `N ≥ 30` before any arithmetic and returns an explicit `insufficient_data` status.
 
 ## Honest scope
 
@@ -177,7 +231,8 @@ Get a Gemini API key at **https://aistudio.google.com/apikey**.
 ```
 
 Omit `--live` to seed with a deterministic offline Tier 2 stub — no API key, no cost, same
-numbers. The frontend lives in `frontend/` and builds into `static/dist`, which FastAPI serves:
+numbers. Add `--big` for 600 events, which is what the screenshots above were taken from.
+The frontend lives in `frontend/` and builds into `static/dist`, which FastAPI serves:
 
 ```bash
 cd frontend
@@ -199,8 +254,14 @@ eligible event.
 
 ## Tech stack
 
-Python 3.12, FastAPI, SQLAlchemy 2, PostgreSQL 16, Google Gemini 3.5 Flash-Lite, React 18 +
-Vite + TypeScript, Tailwind CSS, shadcn/ui, recharts, pytest.
+| Layer | Choice | Why |
+| --- | --- | --- |
+| Backend | Python 3.12 + FastAPI | Async webhooks, pydantic validation, minimal boilerplate. |
+| Database | PostgreSQL 16 + SQLAlchemy 2 | Money-movement invariants — idempotency, one settled row per key — are unique constraints, not application code. |
+| LLM | Google Gemini 3.5 Flash-Lite | Tier 2 classification only, fixed-ontology JSON mode, `thinking_level="minimal"` so the 256-token budget goes to content instead of thinking (`layers/diagnosis.py`). |
+| Frontend | React 18 + Vite + TypeScript | One-line dev iteration; TSX turns API shape drift into a compile error. |
+| UI | Tailwind + shadcn/ui + recharts | Accessibility-checked palette, no custom charting code. |
+| Tests | pytest + pytest-asyncio + freezegun | Real Postgres under 100-thread bursts, no mocked locks. |
 
 ---
 
