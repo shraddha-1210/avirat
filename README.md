@@ -158,34 +158,46 @@ What each layer owns, and the specific failure it exists to prevent:
 
 ![Overview tab — recovered vs control, SLA rate, MTTR by tier, anomaly table](docs/screenshots/dashboard.png)
 
-The headline ₹60,144 is treatment minus control (₹3,97,887 against ₹3,37,743), not gross
-collections — the arms hold 144 and 145 mandates, so ₹434 per mandate is the comparable
-figure. MTTR is split by diagnosis tier (16.7h / 15.8h / 12.9h) and counts only actions that
-reached a terminal state; the 43 still in flight are excluded rather than counted as zero,
-which would drag the average down. The anomaly table applies the N ≥ 30 gate per segment
-before computing any MAD, so a thin segment reports `insufficient_data` instead of a spike.
+The headline ₹60,144 is treatment minus control on settled ledger amounts, not gross
+collections — the arms hold 144 and 145 mandates, so the ₹434 per mandate underneath it is
+the comparable figure. The SLA tile reads 50.8%, and its denominator is every dispatched
+action (99 of 195) rather than only the resolved ones, so the 43 still in flight cannot
+flatter it. MTTR is split by diagnosis tier and counts only actions that reached a terminal
+state, which is why each tier reports its in-flight count beside its resolved one — 24, 30
+and 8 against 166, 64 and 9. The anomaly table applies the N ≥ 30 gate per segment before
+computing any MAD, so a thin segment would report `insufficient_data` rather than a spike;
+here all four segments clear it, with 134 anomalies flagged in the last 24h.
 
 ### Ops Queue
 
-![Ops Queue — safe holds, manual reviews and quarantined strings with risk and SLA columns](docs/screenshots/ops_queue.png)
+![Ops Queue — safe holds, manual reviews, quarantined strings and TTL escalations with risk and SLA columns](docs/screenshots/ops_queue.png)
 
-90 cases the pipeline decided not to act on by itself: SAFE_HOLD and MANUAL_REVIEW actions,
-plus 17 decline strings that fell to Tier 3 quarantine. Every row carries the risk score that
-produced it and its own SLA clock — 22.8h remaining here, 0 breached. Approving a quarantined
-string writes a Tier 1 rule, which is where the 10 Tier 1 rules in the counter above came
-from; the next event carrying that string resolves with no LLM call.
+94 cases the pipeline decided not to act on by itself, in four kinds: SAFE HOLD and MANUAL
+REVIEW actions the policy withheld, 19 decline strings that fell to Tier 3 quarantine, and
+ESCALATION rows the TTL watchdog swept out of `processing`. Every action row carries the risk
+score that produced it — 0.048 for the `authentication_failure` on MND-00271 · 2026-08 at the
+top, 0.594 for the undiagnosed MND-00327 below it — next to its own SLA clock, showing 11.7h
+to 12.8h left and 0 breached. Quarantine rows are the only ones with an Approve button,
+because they are the only ones where a human decision changes future behaviour: approving
+writes a Tier 1 rule, which is where the 10 in the Tier 1 rules counter came from, and the
+next event carrying that string then resolves with no LLM call. The unmapped strings are
+visible in the DETAIL column — `gateway declined: reason unclear`, `ERR_UNMAPPED_9007`,
+`XZ-991` — with chaos-injected `MYSTERIOUS_FAILURE_XYZ` rows at the bottom.
 
 ### Chaos trigger
 
-![Chaos trigger — injecting MYSTERIOUS_FAILURE_XYZ and the four-stage pipeline trace](docs/screenshots/chaos_trigger.png)
+![Chaos trigger — injecting ERR_UNMAPPED_9007 and the four-stage pipeline trace](docs/screenshots/chaos_trigger.png)
 
 Pushes one synthetic decline through the real endpoints and shows each stage as it returns;
 the preset row includes `<script>alert(1)</script>` to exercise sanitization. Here
-`MYSTERIOUS_FAILURE_XYZ` at ₹4,800 clears Detect as normal (N=60, MAD 1.000), then fails to
-map at Tier 2 and quarantines at confidence 0.10. Policy is the part worth reading: risk
-scored 0.808 and the cost-benefit check passed (expected loss ₹1,920 against ₹1,600 to run
-the alt rail), and it still returned MANUAL_REVIEW rather than move money, because an
-undiagnosed failure is not something to act on — Reconcile is skipped for the same reason.
+`ERR_UNMAPPED_9007` at ₹9,000 clears Detect as normal — an observed 5 against a median of 3,
+MAD 1.000 on a sample of 60, inside a threshold of 3 — then fails to map at Tier 2 and
+quarantines at Tier 3 with confidence 0.10, the reply recorded as `llm could not map the
+string (cause='unknown')`. Policy is the part worth reading: it scored risk 0.8283 and the
+cost-benefit check *passed*, an expected loss of ₹3,600 clearing the ₹1,600 alt-rail cost,
+and it still returned MANUAL_REVIEW rather than move money. The recorded reason is `diagnosis
+quarantined — no automated action on an undiagnosed failure`, and Reconcile is skipped on the
+same grounds — quarantine outranks two gates that both said yes.
 
 ### Reconciliation
 
@@ -194,20 +206,25 @@ undiagnosed failure is not something to act on — Reconcile is skipped for the 
 Every key where both rails opened a hold: 20 in this run, all 20 closed by refunding the
 loser, against 222 settled rows overall. Each card shows both ledger rows for one key — the
 mandate rail settled, the alt rail hit `UNIQUE (mandate_id, billing_cycle) WHERE status =
-'settled'` and was auto-refunded for the identical amount. The gaps run from 63 minutes to
-34.8 hours, far outside the 300-second hold window, which is the case a `SELECT`-then-`UPDATE`
-check tends to miss.
+'settled'` and was auto-refunded for the identical amount. The gaps run from 7 minutes to
+33.6 hours — even the tightest of them is outside the 300-second hold window, which is the
+case a `SELECT`-then-`UPDATE` check tends to miss.
 
 ### Audit trail
 
-![Audit trail — decision trace for MND-00271, from decline event through TTL escalation](docs/screenshots/audit.png)
+![Audit trail — decision trace for MND-00001 / 2026-07, a control-arm key with no action dispatched](docs/screenshots/audit.png)
 
 One key's whole history, assembled from what each layer recorded at the time rather than
-reconstructed afterwards. MND-00271 / 2026-08 declined with `U54`, resolved at Tier 1 as
-`authentication_failure` at confidence 1.00 with no LLM call, then took SAFE_HOLD with the
-arithmetic attached: score 0.048 against a 0.60 threshold, expected loss ₹79.60 against
-₹1,600 to run the alt rail. Nothing ever settled on it, so the TTL watchdog escalated it at
-10:58 PM; the raw `GET /api/audit/decision/...` response sits below the trace.
+reconstructed afterwards. MND-00001 / 2026-07 carries three decline events in the one billing
+cycle — `M014`, `TECHNICAL_ERROR` and `U69`, all on AXIS:UPI_AUTOPAY at ₹4,999 — and all
+three are tagged `control`, which is what makes this particular trace worth reading. The
+control arm is ingested and recorded like everything else but never receives a recovery
+action, so DIAGNOSES is empty and ACTION reads *No action was dispatched*; that absence is
+the counterfactual the ₹ recovered figure is measured against, shown rather than asserted.
+Reconciliation still carries two rows, because the key was raced — `alt_rail` auto_refunded
+and `mandate` settled, both ₹4,999, resolved about 23 hours apart. The raw
+`GET /api/audit/decision/MND-00001/2026-07` response sits below the trace, so nothing in the
+panel is a rendering the API cannot back.
 
 ## What actually works
 
