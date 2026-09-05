@@ -4,6 +4,13 @@
 
 [![CI](https://github.com/shraddha-1210/avirat/actions/workflows/ci.yml/badge.svg)](https://github.com/shraddha-1210/avirat/actions/workflows/ci.yml)
 
+## Demo
+
+▶ [Watch the 5-minute walkthrough](https://drive.google.com/file/d/11M8mLQ07Mj5p-DFbvWktYhry-MJsJigI/view?usp=sharing)
+
+Live tour of the pipeline: chaos injection, ontology promotion, reconciliation collision,
+and audit trail — every number produced by code in this repo.
+
 ## The problem
 
 A UPI AutoPay mandate rarely fails loudly. It fails once for a recoverable reason — the bank
