@@ -37,6 +37,20 @@ Everything is measured against a randomised control arm on the same seeded datas
 headline recovery figure is a difference against a counterfactual rather than a restatement
 of gross collections.
 
+## Who this is for
+
+Recurring-revenue businesses collecting on UPI AutoPay — subscription SaaS, OTT, EdTech,
+lending EMI, insurance premium collection — anywhere a mandate going quietly dead is churn
+rather than a support ticket. The operators are payment ops and revenue/finance teams who own
+recurring collections: the people who currently find out weeks late from a dashboard, not the
+engineers who would otherwise go and read the decline logs. It sits alongside an existing PSP
+— Razorpay, Cashfree, whoever executes the mandate — as a recovery layer above mandate
+execution rather than a competing mandate stack, and the decline webhook it consumes is the
+one the PSP already emits. Scope is deliberately narrow: UPI AutoPay and the RBI e-mandate
+flow. Card-on-file recurring, one-time payments and non-Indian rails are out of scope,
+because the decline codes, the failure modes and the regulatory constraints differ enough
+that stretching the same ontology and policy gates across them would make both wrong.
+
 ## Architecture
 
 Seven layers because each one is a distinct place a recovery system goes wrong, and keeping
