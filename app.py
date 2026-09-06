@@ -10,25 +10,60 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
+import logging
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import store
-from db import get_session
+from db import get_session, init_db
 from layers.detection import check_anomaly
 from layers.pipeline import run_recovery
 from layers.diagnosis import (
     ONTOLOGY_SET,
+    OntologyPersistenceError,
     OntologyPromotionError,
     TIER1_RULES,
+    load_promoted_rules,
     promote_to_tier1,
+    promoted_rules,
 )
 from layers.metrics import compute_metrics, decision_trace
 from layers.reconciliation import resolve_path
 
-app = FastAPI(title="Avirata — Silent Mandate Death Recovery Agent")
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Create tables, then rebuild Tier 1 from the persisted promotions.
+
+    This is what makes an approved rule survive a restart: the dict in
+    `layers.diagnosis` is rebuilt from `tier1_promoted_rules` before the first
+    request is served.
+
+    A database that is unreachable at boot is logged and tolerated rather than
+    fatal, because the API has always started without one (the dashboard falls back
+    to its pre-React page, the metrics routes 500 individually). Tier 1 then serves
+    the hardcoded baseline only. Promotion itself is NOT tolerant: it fails closed,
+    so a degraded start cannot quietly accept a rule it will lose.
+    """
+    try:
+        init_db()
+        loaded = load_promoted_rules()
+        logger.info("startup: %d persisted ontology promotion(s) reloaded", loaded)
+    except Exception:  # noqa: BLE001 - a missing DB must not stop the API booting
+        logger.exception("startup: could not reload persisted ontology promotions")
+    yield
+
+
+app = FastAPI(
+    title="Avirata — Silent Mandate Death Recovery Agent",
+    lifespan=lifespan,
+)
 
 _LOOKBACK_DAYS = 60
 
@@ -249,14 +284,20 @@ def promote_ontology(req: OntologyPromotionIn) -> dict:
     Closes the ontology loop: a string that fell to Tier 3 is reviewed, mapped,
     and thereafter resolves instantly at Tier 1 without an LLM call.
 
-    DEMO SCOPE: the rule lives in the process's `TIER1_RULES` dict and does not
-    survive a restart. Production would persist it with an approver and an audit
-    record; nothing here records WHO approved the mapping.
+    The rule is written to `tier1_promoted_rules` and only then applied in memory,
+    so it survives a restart. The two failure modes are deliberately different
+    status codes: 400 means the operator asked for something invalid, 500 means the
+    write did not land and the running process has NOT started honouring the rule.
+
+    DEMO SCOPE: `promoted_by` is hardcoded to 'ops' because this build has no auth.
     """
     try:
         result = promote_to_tier1(req.raw_input, req.target_cause)
     except OntologyPromotionError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except OntologyPersistenceError as exc:
+        # Fail closed: nothing was written and TIER1_RULES is untouched.
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return {
         "ok": True,
@@ -266,8 +307,21 @@ def promote_ontology(req: OntologyPromotionIn) -> dict:
             "target_cause": result["target_cause"],
         },
         "replaced": result["previous_cause"],
-        "note": "in-memory for the demo; a restart reverts it",
+        "note": "persisted to tier1_promoted_rules; survives a restart",
     }
+
+
+@app.get("/api/ontology/promoted-rules")
+def ontology_promoted_rules() -> dict:
+    """The persisted promotions, newest first, with timestamps.
+
+    `/api/ontology/rules` shows what the process is serving right now (baseline plus
+    promotions, merged). This shows only what is durable, which is what a reader
+    needs to tell "this rule survives a restart" from "this rule happens to be in
+    memory".
+    """
+    rows = promoted_rules()
+    return {"promoted_rules": rows, "count": len(rows)}
 
 
 @app.get("/api/ontology/rules")

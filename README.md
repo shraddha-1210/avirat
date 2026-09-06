@@ -328,8 +328,11 @@ fully-loaded cost assumption requiring finance sign-off, not a gateway fee.
 
 **Not built.** Multi-tenant auth, production observability, and real RBI e-mandate / AFA
 integration. Alt-rail execution is flagged in code as a **prototype requiring RBI e-mandate /
-AFA review before any production use**. Ontology promotions are in-memory and revert on
-restart. Cron loops are demo-scale pollers; production would be event-driven.
+AFA review before any production use**. Ontology promotions now persist to a
+`tier1_promoted_rules` table and are reloaded into Tier 1 at startup, so an approved rule
+survives a restart; what is still missing is the approver identity, since there is no auth
+and every row is written as 'ops'. Cron loops are demo-scale pollers; production would be
+event-driven.
 
 ## Running it locally
 

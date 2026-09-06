@@ -10,6 +10,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     Index,
     DateTime,
     Float,
@@ -25,6 +26,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from db import Base
+from layers.ingestion import ONTOLOGY_SET
 
 
 class Mandate(Base):
@@ -191,3 +193,41 @@ class CommunicationState(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
+
+
+class Tier1PromotedRule(Base):
+    """Ops-approved Tier 3 -> Tier 1 promotions, persisted so they survive a restart.
+
+    This is the durable half of the ontology loop. `layers.diagnosis.TIER1_RULES`
+    stays the hot path (an in-process dict lookup, no query per diagnosis); these
+    rows are the source of truth that the dict is rebuilt from at startup.
+
+    `raw_input` stores the NORMALISED key — stripped and upper-cased exactly as
+    `diagnose_tier1` looks it up. Storing the raw operator input instead would let
+    'xz-991' and 'XZ-991' both insert and race to define the same rule, which the
+    UNIQUE constraint is here to prevent.
+
+    `target_cause` is constrained at the database level to the fixed ontology, so a
+    bad write fails on the constraint rather than silently teaching Tier 1 a cause
+    the rest of the pipeline cannot act on. The application refuses 'unknown'
+    separately (a Tier 1 rule resolves with confidence 1.0).
+
+    `promoted_by` is nullable and currently always 'ops': there is no auth in this
+    build, and recording a fabricated identity would be worse than recording none.
+    """
+
+    __tablename__ = "tier1_promoted_rules"
+    __table_args__ = (
+        CheckConstraint(
+            "target_cause IN (" + ", ".join(f"'{c}'" for c in sorted(ONTOLOGY_SET)) + ")",
+            name="ck_tier1_promoted_cause_in_ontology",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    raw_input: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    target_cause: Mapped[str] = mapped_column(String(32))
+    promoted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    promoted_by: Mapped[str | None] = mapped_column(String(64), nullable=True)

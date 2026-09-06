@@ -27,7 +27,10 @@ import json
 import logging
 import re
 from dataclasses import asdict, dataclass
+from datetime import timezone
 from typing import Literal
+
+from sqlalchemy import func
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -56,6 +59,16 @@ TIER1_RULES: dict[str, str] = {
     "U90": "technical_decline",
     "U68": "technical_decline",
 }
+
+# The hardcoded rules above are the BASELINE. Promoted rules from
+# `tier1_promoted_rules` are layered on top at startup and may override a baseline
+# entry, so this frozen copy is what "baseline" means once the dict has been
+# reloaded. Kept so a reload is idempotent rather than cumulative.
+_BASELINE_TIER1_RULES: dict[str, str] = dict(TIER1_RULES)
+
+# Every promotion is attributed to this until the build has real auth. Recording a
+# fabricated operator identity would be worse than recording a placeholder.
+PROMOTED_BY_DEFAULT = "ops"
 
 # Resolving to `unknown` is not a resolution — it is the model honestly saying
 # it cannot map the string, which is exactly what Tier 3 exists for.
@@ -181,7 +194,101 @@ class OntologyPromotionError(ValueError):
     """A promotion was refused. Carries a message safe to return to the caller."""
 
 
-def promote_to_tier1(raw_input: str, target_cause: str) -> dict:
+class OntologyPersistenceError(RuntimeError):
+    """The promotion could not be durably written. The in-memory dict is untouched.
+
+    Raised separately from `OntologyPromotionError` because the two mean opposite
+    things to a caller: a promotion error is the operator's input being wrong (400),
+    this is our storage being unavailable (500). Collapsing them would let a failed
+    write look like a rejected one.
+    """
+
+
+def normalise_key(raw_input: str) -> str:
+    """The one place a rule key is normalised. `diagnose_tier1` looks up the same shape."""
+    return str(raw_input).strip().upper()
+
+
+def load_promoted_rules(session=None) -> int:
+    """Rebuild `TIER1_RULES` as baseline + persisted promotions. Returns the count loaded.
+
+    Called at application startup so a restarted process sees every promotion an
+    operator has ever approved. Idempotent: the dict is reset to the frozen baseline
+    first, so calling this twice does not accumulate stale keys, and a promotion that
+    was later re-pointed at a different cause lands on its current value.
+    """
+    from sqlalchemy import select
+
+    from models import Tier1PromotedRule
+
+    owns_session = session is None
+    if owns_session:
+        from db import get_session
+
+        session = get_session()
+    try:
+        rows = session.execute(
+            select(Tier1PromotedRule.raw_input, Tier1PromotedRule.target_cause)
+        ).all()
+    finally:
+        if owns_session:
+            session.close()
+
+    TIER1_RULES.clear()
+    TIER1_RULES.update(_BASELINE_TIER1_RULES)
+    for raw_input, cause in rows:
+        TIER1_RULES[normalise_key(raw_input)] = cause
+
+    logger.info(
+        "tier 1 rules loaded: %d baseline + %d promoted = %d total",
+        len(_BASELINE_TIER1_RULES),
+        len(rows),
+        len(TIER1_RULES),
+    )
+    return len(rows)
+
+
+def promoted_rules(session=None) -> list[dict]:
+    """Every persisted promotion, newest first, for the Ops UI and for verification."""
+    from sqlalchemy import select
+
+    from models import Tier1PromotedRule
+
+    owns_session = session is None
+    if owns_session:
+        from db import get_session
+
+        session = get_session()
+    try:
+        rows = session.execute(
+            select(Tier1PromotedRule).order_by(Tier1PromotedRule.promoted_at.desc())
+        ).scalars().all()
+        return [
+            {
+                "id": r.id,
+                "raw_input": r.raw_input,
+                "target_cause": r.target_cause,
+                "promoted_at": (
+                    r.promoted_at
+                    if r.promoted_at.tzinfo
+                    else r.promoted_at.replace(tzinfo=timezone.utc)
+                ).isoformat(),
+                "promoted_by": r.promoted_by,
+            }
+            for r in rows
+        ]
+    finally:
+        if owns_session:
+            session.close()
+
+
+def promote_to_tier1(
+    raw_input: str,
+    target_cause: str,
+    *,
+    session=None,
+    promoted_by: str = PROMOTED_BY_DEFAULT,
+) -> dict:
     """Add a learned mapping to the Tier 1 rule dict. Closes the ontology loop.
 
     A string that fell to Tier 3 is reviewed by Ops, mapped to a real cause, and
@@ -191,9 +298,16 @@ def promote_to_tier1(raw_input: str, target_cause: str) -> dict:
     The key is normalised the same way `diagnose_tier1` looks it up (stripped,
     upper-cased), otherwise a promoted rule would never match.
 
-    DEMO SCOPE: this mutates the in-process dict, so it does not survive a
-    restart. A production build would persist the rule and reload it at startup,
-    with an audit record of who approved it.
+    **Fail closed.** The row is written to `tier1_promoted_rules` FIRST and the
+    in-memory dict is updated only once that commit succeeds. The other order would
+    let a failed write leave the process serving a rule that no restart could
+    reproduce — a rule that exists on this box and nowhere else, which is precisely
+    the divergence persistence is meant to remove. A storage failure raises
+    `OntologyPersistenceError` and `TIER1_RULES` is left exactly as it was.
+
+    Re-promoting a string that is already persisted UPDATES its cause and timestamp
+    (`ON CONFLICT (raw_input) DO UPDATE`) rather than inserting a duplicate, so the
+    table holds at most one live rule per key.
     """
     raw = str(raw_input).strip()
     if not raw:
@@ -215,11 +329,53 @@ def promote_to_tier1(raw_input: str, target_cause: str) -> dict:
             "so mapping to a non-resolving cause would silently skip quarantine"
         )
 
-    key = raw.upper()
+    key = normalise_key(raw)
     previous = TIER1_RULES.get(key)
+
+    # --- durable write first; memory is only updated if this commits ---------
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from models import Tier1PromotedRule
+
+    owns_session = session is None
+    if owns_session:
+        from db import get_session
+
+        session = get_session()
+    try:
+        stmt = (
+            pg_insert(Tier1PromotedRule)
+            .values(
+                raw_input=key,
+                target_cause=cause,
+                promoted_by=promoted_by,
+            )
+            .on_conflict_do_update(
+                index_elements=["raw_input"],
+                set_={
+                    "target_cause": cause,
+                    "promoted_at": func.now(),
+                    "promoted_by": promoted_by,
+                },
+            )
+        )
+        session.execute(stmt)
+        session.commit()
+    except SQLAlchemyError as exc:
+        session.rollback()
+        logger.error("ontology promotion NOT persisted for %r: %s", key, exc)
+        raise OntologyPersistenceError(
+            f"could not persist promotion for {key!r}: {type(exc).__name__}"
+        ) from exc
+    finally:
+        if owns_session:
+            session.close()
+
+    # --- only now does the running process start honouring the rule ----------
     TIER1_RULES[key] = cause
     logger.info(
-        "ontology promotion: %r -> %r (previously %r)", key, cause, previous
+        "ontology promotion: %r -> %r (previously %r), persisted", key, cause, previous
     )
     return {
         "key": key,
