@@ -14,12 +14,79 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
-import { api, type Summary } from "@/lib/api";
+import { cn } from "@/lib/utils";
+import { api, type GeminiHealth, type Summary } from "@/lib/api";
 import Overview from "@/screens/Overview";
 import OpsQueue from "@/screens/OpsQueue";
 import Chaos from "@/screens/Chaos";
 import Reconciliation from "@/screens/Reconciliation";
 import Audit from "@/screens/Audit";
+
+// Circuit-breaker state -> how the pill reads. Green is the only state that means
+// Tier 2 is actually being consulted; the other two mean quarantines are currently
+// a statement about our dependency rather than a verdict from the model.
+const GEMINI_PILL: Record<
+  GeminiHealth["state"],
+  { variant: "success" | "warning" | "destructive"; label: string; title: string }
+> = {
+  CLOSED: {
+    variant: "success",
+    label: "Gemini OK",
+    title: "Tier 2 circuit closed — Gemini is being called normally",
+  },
+  HALF_OPEN: {
+    variant: "warning",
+    label: "Gemini probing",
+    title: "Tier 2 circuit half-open — one test call is allowed through to check recovery",
+  },
+  OPEN: {
+    variant: "destructive",
+    label: "Gemini down",
+    title:
+      "Tier 2 circuit open — Gemini is not being called. Ambiguous strings quarantine in degraded mode.",
+  },
+};
+
+function GeminiStatusPill() {
+  const [health, setHealth] = useState<GeminiHealth | null>(null);
+
+  useEffect(() => {
+    let alive = true;
+    const poll = async () => {
+      try {
+        const h = await api.geminiHealth();
+        if (alive) setHealth(h);
+      } catch {
+        // The health endpoint being unreachable is a different failure from Gemini
+        // being down, so the pill goes blank rather than claiming either state.
+        if (alive) setHealth(null);
+      }
+    };
+    void poll();
+    const id = setInterval(poll, 5000);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, []);
+
+  if (!health) return null;
+  const pill = GEMINI_PILL[health.state] ?? GEMINI_PILL.CLOSED;
+
+  return (
+    <Badge variant={pill.variant} className="hidden sm:inline-flex" title={pill.title}>
+      <span
+        className={cn(
+          "h-1.5 w-1.5 rounded-full",
+          health.state === "CLOSED" && "bg-emerald-500",
+          health.state === "HALF_OPEN" && "bg-amber-500",
+          health.state === "OPEN" && "bg-destructive"
+        )}
+      />
+      {pill.label}
+    </Badge>
+  );
+}
 
 // Sidebar nav. Drives the nav list only — each tab's content is declared
 // explicitly below because the screens take different props.
@@ -99,6 +166,7 @@ export default function App() {
         <header className="sticky top-0 z-40 border-b bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/75">
           <div className="flex h-16 items-center px-6">
             <div className="ml-auto flex items-center gap-3">
+              <GeminiStatusPill />
               <Badge variant="warning" className="hidden sm:inline-flex">
                 controlled simulation · fixed seed
               </Badge>

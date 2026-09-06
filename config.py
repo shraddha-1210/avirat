@@ -54,6 +54,22 @@ class Settings(BaseSettings):
     ttl_processing_seconds: int = 300          # a case may sit in 'processing' at most this long
     ttl_watchdog_interval_seconds: int = 60    # demo: cron polling; production would be event-driven
 
+    # --- Layer 3 resilience: retries + circuit breaker around the Gemini call ---
+    # Retry ONLY what is positively identifiable as transient (network error, 429,
+    # 5xx). An unrecognised error class is not retried: re-sending a request whose
+    # fate we cannot determine risks duplicating work against a partially-succeeded
+    # call, which is worse than one extra quarantine.
+    tier2_max_retries: int = 2                 # attempts = 1 + this
+    tier2_retry_base_ms: int = 250             # full-jitter base
+    tier2_retry_cap_ms: int = 2000             # per-sleep ceiling
+    # Circuit breaker. The threshold counts LOGICAL call failures in a rolling
+    # window — retries inside one call count once, or a threshold of 3 would really
+    # be a threshold of 1. Illustrative demo values; retune on real traffic.
+    circuit_failure_threshold: int = 3
+    circuit_cooldown_seconds: int = 60
+    circuit_half_open_test_calls: int = 1
+    circuit_window_seconds: int = 60
+
     # --- Layer 5: reconciliation ---
     settlement_hold_seconds: int = 300         # collision window for auto-refund of the losing path
 

@@ -24,6 +24,7 @@ from layers.detection import check_anomaly
 from layers.pipeline import run_recovery
 from layers.diagnosis import (
     ONTOLOGY_SET,
+    tier2_metrics,
     OntologyPersistenceError,
     OntologyPromotionError,
     TIER1_RULES,
@@ -91,6 +92,18 @@ class DeclineEventIn(BaseModel):
 @app.get("/api/health")
 def health() -> dict:
     return {"status": "ok", "service": "avirata", "phase": "6-metrics-dashboard"}
+
+
+@app.get("/api/health/gemini")
+def gemini_health() -> dict:
+    """Circuit-breaker state for the Tier 2 Gemini dependency.
+
+    Public and unauthenticated, matching `/api/health`. This is what turns a
+    silent degradation into a visible one: when the circuit is OPEN every decline
+    string still quarantines, but the quarantine now means "we did not ask" rather
+    than "the model could not map it", and the operator can tell which.
+    """
+    return tier2_metrics()
 
 
 @app.post("/api/events/ingest")

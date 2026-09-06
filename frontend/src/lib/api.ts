@@ -253,8 +253,19 @@ async function req<T>(url: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+export type GeminiHealth = {
+  state: "CLOSED" | "OPEN" | "HALF_OPEN";
+  failure_count_last_60s: number;
+  last_failure_at: string | null;
+  next_test_at: string | null;
+  retries_attempted: number;
+  retries_succeeded: number;
+};
+
 export const api = {
   summary: () => req<Summary>("/api/dashboard/summary"),
+
+  geminiHealth: () => req<GeminiHealth>("/api/health/gemini"),
 
   audit: (mandateId: string, billingCycle: string) =>
     req<AuditTrace>(

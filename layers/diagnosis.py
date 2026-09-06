@@ -25,7 +25,10 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import re
+import socket
+import time
 from dataclasses import asdict, dataclass
 from datetime import timezone
 from typing import Literal
@@ -35,6 +38,7 @@ from sqlalchemy import func
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from config import settings
+from layers.circuit_breaker import CircuitBreaker, CircuitOpenError
 from layers.ingestion import ONTOLOGY_SET
 
 logger = logging.getLogger(__name__)
@@ -73,6 +77,9 @@ PROMOTED_BY_DEFAULT = "ops"
 # Resolving to `unknown` is not a resolution — it is the model honestly saying
 # it cannot map the string, which is exactly what Tier 3 exists for.
 _NON_RESOLVING_CAUSES: frozenset[str] = frozenset({"unknown"})
+
+# Distinguishes "caller passed None deliberately" from "caller said nothing".
+_UNSET = object()
 
 _HTML_TAG = re.compile(r"<[^>]*>")
 _CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f]")
@@ -154,6 +161,159 @@ _TIER2_CACHE: dict[str, str] = {}
 
 def clear_tier2_cache() -> None:
     _TIER2_CACHE.clear()
+
+
+# ---------------------------------------------------------------------------
+# Resilience around the Tier 2 call: jittered retries, then a circuit breaker.
+#
+# The two answer different questions and are deliberately not the same policy:
+#
+#   retry   — "is this one attempt worth repeating right now?"
+#   breaker — "is this dependency worth calling at all?"
+#
+# So a 4xx is NOT retried (repeating a rejected request just rejects again) but it
+# DOES count toward the breaker: a bad API key returns 4xx forever, and continuing
+# to call Gemini once per event for that is exactly the waste the breaker exists to
+# stop. Conversely a malformed JSON reply counts as NEITHER — Gemini answered, we
+# reached it fine, the reply was simply unusable, and quarantine already handles it.
+# ---------------------------------------------------------------------------
+TIER2_BREAKER = CircuitBreaker(
+    failure_threshold=settings.circuit_failure_threshold,
+    cooldown_seconds=settings.circuit_cooldown_seconds,
+    half_open_test_calls=settings.circuit_half_open_test_calls,
+    window_seconds=settings.circuit_window_seconds,
+    name="gemini-tier2",
+)
+
+# Retry counters. Deliberately plain ints behind the same lock-free read the health
+# endpoint uses: this is demo-scale observability, not a metrics backend.
+_METRICS = {"retries_attempted": 0, "retries_succeeded": 0, "calls_skipped_open": 0}
+
+
+def tier2_metrics() -> dict:
+    """Counters plus the live breaker state, for `/api/health/gemini`."""
+    snap = TIER2_BREAKER.snapshot().to_dict()
+    snap.update(dict(_METRICS))
+    snap["circuit_state"] = snap["state"]
+    snap["circuit_transitions"] = snap["transitions"]
+    return snap
+
+
+def reset_tier2_resilience() -> None:
+    """Clean breaker + counters. For tests and for an operator override."""
+    TIER2_BREAKER.reset()
+    for k in _METRICS:
+        _METRICS[k] = 0
+
+
+# Exception types that always mean "the network, not the answer".
+_TRANSIENT_EXC_TYPES = (
+    ConnectionError,
+    TimeoutError,
+    socket.timeout,
+    socket.gaierror,
+)
+
+# Substrings that identify a transient condition when the SDK reports it as text
+# rather than as a status code. Deliberately narrow: a false positive here means
+# re-sending a request whose outcome we do not know.
+_TRANSIENT_MARKERS = (
+    "rate limit",
+    "resource_exhausted",
+    "unavailable",
+    "deadline exceeded",
+    "timed out",
+    "timeout",
+    "connection reset",
+    "connection aborted",
+    "temporarily unavailable",
+)
+
+
+def _status_code_of(exc: Exception) -> int | None:
+    """Best-effort HTTP status from an SDK exception, without importing the SDK."""
+    for attr in ("code", "status_code"):
+        value = getattr(exc, attr, None)
+        if isinstance(value, int) and 100 <= value <= 599:
+            return value
+    response = getattr(exc, "response", None)
+    value = getattr(response, "status_code", None)
+    if isinstance(value, int) and 100 <= value <= 599:
+        return value
+    return None
+
+
+def is_retryable(exc: Exception) -> bool:
+    """Only positively-identified transient failures are retried.
+
+    An unrecognised exception class is NOT retried. That is the conservative
+    direction: an un-retried transient failure costs one extra quarantine, while a
+    retried non-idempotent failure can double-charge the dependency for work it may
+    already have done.
+    """
+    if isinstance(exc, _TRANSIENT_EXC_TYPES):
+        return True
+
+    code = _status_code_of(exc)
+    if code is not None:
+        return code == 429 or 500 <= code < 600
+
+    # OSError covers the socket-level failures not caught above, but only when it
+    # is not one of its non-network subclasses.
+    if isinstance(exc, OSError) and not isinstance(exc, (FileNotFoundError, PermissionError)):
+        return True
+
+    text = str(exc).lower()
+    return any(marker in text for marker in _TRANSIENT_MARKERS)
+
+
+def _backoff_seconds(attempt: int) -> float:
+    """Full jitter (AWS pattern): sleep = uniform(0, min(cap, base * 2**attempt)).
+
+    Full jitter rather than equal jitter because the failure mode being defended
+    against is a fleet of workers retrying in lockstep after a shared outage; the
+    wider spread is what breaks the convoy.
+    """
+    base = settings.tier2_retry_base_ms / 1000.0
+    cap = settings.tier2_retry_cap_ms / 1000.0
+    return random.uniform(0.0, min(cap, base * (2 ** attempt)))
+
+
+# Patchable seam so tests do not sleep through real backoff.
+_sleep = time.sleep
+
+
+def _call_tier2_with_retries(sanitized: str) -> str:
+    """Call the Gemini seam, retrying only identified transient failures.
+
+    Looks `call_tier2_llm` up through the module globals on every attempt so the
+    test monkeypatch of `layers.diagnosis.call_tier2_llm` still applies.
+    """
+    attempts = settings.tier2_max_retries + 1
+    last_exc: Exception | None = None
+
+    for attempt in range(attempts):
+        try:
+            reply = call_tier2_llm(sanitized)
+        except Exception as exc:  # noqa: BLE001 — classified immediately below
+            last_exc = exc
+            if attempt + 1 >= attempts or not is_retryable(exc):
+                raise
+            _METRICS["retries_attempted"] += 1
+            delay = _backoff_seconds(attempt)
+            logger.warning(
+                "tier 2 attempt %d/%d failed (%s); retrying in %.3fs",
+                attempt + 1, attempts, type(exc).__name__, delay,
+            )
+            _sleep(delay)
+            continue
+
+        if attempt > 0:
+            _METRICS["retries_succeeded"] += 1
+            logger.info("tier 2 recovered on attempt %d/%d", attempt + 1, attempts)
+        return reply
+
+    raise last_exc  # unreachable; the loop either returns or raises
 
 
 def call_tier2_llm(sanitized_error: str, *, model: str | None = None) -> str:
@@ -414,16 +574,49 @@ def diagnose_tier2(raw_error_code: str, *, use_cache: bool = True) -> DiagnosisR
             raw_error_code, sanitized, "error string was empty after sanitization"
         )
 
-    try:
-        if use_cache and sanitized in _TIER2_CACHE:
-            raw_reply = _TIER2_CACHE[sanitized]
-        else:
-            raw_reply = call_tier2_llm(sanitized)
-            if use_cache:
-                _TIER2_CACHE[sanitized] = raw_reply
-    except Exception as exc:  # noqa: BLE001 — an LLM outage must not crash the pipeline
-        logger.warning("tier 2 LLM call failed: %s", exc)
-        return _quarantine(raw_error_code, sanitized, f"llm call failed: {type(exc).__name__}")
+    if use_cache and sanitized in _TIER2_CACHE:
+        # A cache hit reaches no dependency, so it neither consults nor informs the
+        # breaker. Letting a memo hit close an open circuit would be a lie.
+        raw_reply = _TIER2_CACHE[sanitized]
+    else:
+        if not TIER2_BREAKER.allows_call():
+            # Degraded mode. The distinction the operator needs is that this is a
+            # statement about OUR system, not a verdict from the model: nothing was
+            # asked, so nothing was answered.
+            _METRICS["calls_skipped_open"] += 1
+            logger.warning(
+                "tier 2 skipped: circuit is %s (degraded mode)", TIER2_BREAKER.state
+            )
+            return _quarantine(
+                raw_error_code,
+                sanitized,
+                "gemini circuit open (degraded mode)",
+                llm_model=None,
+            )
+
+        try:
+            raw_reply = _call_tier2_with_retries(sanitized)
+        except CircuitOpenError:
+            _METRICS["calls_skipped_open"] += 1
+            return _quarantine(
+                raw_error_code,
+                sanitized,
+                "gemini circuit open (degraded mode)",
+                llm_model=None,
+            )
+        except Exception as exc:  # noqa: BLE001 — an LLM outage must not crash the pipeline
+            TIER2_BREAKER.record_failure()
+            logger.warning("tier 2 LLM call failed: %s", exc)
+            return _quarantine(
+                raw_error_code, sanitized, f"llm call failed: {type(exc).__name__}"
+            )
+
+        # Reaching the dependency at all is the success the breaker cares about.
+        # Whether the REPLY is usable is a separate question, handled below, and a
+        # bad reply must not be read as Gemini being unreachable.
+        TIER2_BREAKER.record_success()
+        if use_cache:
+            _TIER2_CACHE[sanitized] = raw_reply
 
     try:
         parsed = json.loads(_strip_code_fence(raw_reply))
@@ -511,8 +704,17 @@ def tier_summary(results: list[DiagnosisResult]) -> dict:
 # helpers
 # ---------------------------------------------------------------------------
 def _quarantine(
-    raw: str, sanitized: str | None, reason: str, confidence: float | None = None
+    raw: str,
+    sanitized: str | None,
+    reason: str,
+    confidence: float | None = None,
+    llm_model: str | None = _UNSET,
 ) -> DiagnosisResult:
+    """`llm_model=None` means no call was made — pass it for degraded-mode results.
+
+    Reporting a model name on a quarantine that never reached the model would undo
+    exactly the distinction the circuit breaker exists to draw.
+    """
     return DiagnosisResult(
         cause=None,
         tier=3,
@@ -520,7 +722,7 @@ def _quarantine(
         confidence=confidence,
         raw_input=raw,
         sanitized_input=sanitized,
-        llm_model=settings.tier2_model,
+        llm_model=settings.tier2_model if llm_model is _UNSET else llm_model,
         reason=reason,
     )
 
