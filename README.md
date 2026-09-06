@@ -311,6 +311,12 @@ the risk gate always tripped first, making the second gate dead code. It was ret
   again.
 - **Sparse data never produces a false anomaly.** MAD detection in `layers/detection.py`
   checks `N ≥ 30` before any arithmetic and returns an explicit `insufficient_data` status.
+- **Gemini failures degrade gracefully.** A circuit breaker in `layers/circuit_breaker.py`
+  opens after 3 failures in 60 seconds; while open, Tier 2 requests skip the API entirely and
+  quarantine with reason "gemini circuit open (degraded mode)", which is visibly a system
+  state rather than a wrong classification. Transient failures (network, 429, 5xx) retry with
+  exponential backoff and full jitter; 4xx errors and malformed responses do not retry,
+  because repeating them does not help.
 
 ## Honest scope
 
